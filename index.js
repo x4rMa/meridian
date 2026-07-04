@@ -1596,7 +1596,11 @@ async function telegramHandler(msg) {
         reason: "Telegram slash command /setcfg",
       });
       if (!result?.success) {
-        await sendMessage(`Config update failed.\nUnknown: ${(result?.unknown || []).join(", ") || "none"}`).catch(() => {});
+        const unknownList = (result?.unknown || []).join(", ") || "none";
+        const failure = result?.error
+          ? `${result.key || key}: ${result.error}`
+          : `Unknown: ${unknownList}`;
+        await sendMessage(`Config update failed.\n${failure}`).catch(() => {});
         return;
       }
       await sendMessage(`✅ Updated ${key} = ${JSON.stringify(value)}`).catch(() => {});

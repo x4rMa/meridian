@@ -357,6 +357,8 @@ function normalizeConfigValue(key, value) {
     "category",
     "discordSignalMode",
     "strategy",
+    "indicatorEntryPreset",
+    "indicatorExitPreset",
     "managementModel",
     "screeningModel",
     "generalModel",
