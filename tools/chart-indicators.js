@@ -17,11 +17,39 @@ function safeNum(value) {
   return safeNumber(value, null);
 }
 
+/**
+ * Stochastic RSI — standard %K formula applied to the RSI series.
+ *   StochRSI = (RSI_latest - min(RSI, last N)) / (max(RSI, last N) - min(RSI, last N)) × 100
+ * Returns null if the series has fewer than `length` non-null points.
+ * If max == min (flat RSI), returns 50 (neutral) to avoid div-by-zero.
+ *
+ * @param {Array<{time:number,value:number}|null>} rsiSeries — indicators.rsi[]
+ * @param {number} length — lookback window (default 14)
+ * @returns {number|null} StochRSI_k in [0, 100]
+ */
+export function computeStochRsi(rsiSeries, length = 14) {
+  if (!Array.isArray(rsiSeries)) return null;
+  const vals = rsiSeries
+    .map((point) => (point && typeof point.value === "number" ? point.value : null))
+    .filter((v) => v != null && Number.isFinite(v));
+  if (vals.length < length) return null;
+  const window = vals.slice(-length);
+  const latest = window[window.length - 1];
+  const min = Math.min(...window);
+  const max = Math.max(...window);
+  const range = max - min;
+  if (range === 0) return 50; // flat RSI — neutral, avoids div-by-zero
+  return ((latest - min) / range) * 100;
+}
+
 function buildSignalSummary(payload) {
   const latest = payload?.latest || {};
   const candle = latest?.candle || {};
   const previousCandle = latest?.previousCandle || {};
   const rsi = safeNum(latest?.rsi?.value);
+  // Stoch RSI is computed locally from the full RSI series (indicators.rsi[]),
+  // not from latest.rsi — the API exposes the series so we can derive it.
+  const stochRsi = computeStochRsi(payload?.indicators?.rsi, Number(config.indicators.stochRsiLength ?? 14));
   const bollinger = latest?.bollinger || {};
   const supertrend = latest?.supertrend || {};
   const fibonacciLevels = latest?.fibonacci?.levels || {};
@@ -29,6 +57,7 @@ function buildSignalSummary(payload) {
     close: safeNum(candle.close),
     previousClose: safeNum(previousCandle.close),
     rsi,
+    stochRsi,
     lowerBand: safeNum(bollinger.lower),
     middleBand: safeNum(bollinger.middle),
     upperBand: safeNum(bollinger.upper),
@@ -42,15 +71,18 @@ function buildSignalSummary(payload) {
   };
 }
 
-function evaluatePreset(side, preset, payload) {
+export function evaluatePreset(side, preset, payload) {
   const summary = buildSignalSummary(payload);
   const oversold = Number(config.indicators.rsiOversold ?? 30);
   const overbought = Number(config.indicators.rsiOverbought ?? 80);
+  const stochOversold = Number(config.indicators.stochRsiOversold ?? 20);
+  const stochOverbought = Number(config.indicators.stochRsiOverbought ?? 80);
   const close = summary.close;
   const previousClose = summary.previousClose;
   const lowerBand = summary.lowerBand;
   const upperBand = summary.upperBand;
   const rsi = summary.rsi;
+  const stochRsi = summary.stochRsi;
   const isBullish = summary.supertrendDirection === "bullish";
   const isBearish = summary.supertrendDirection === "bearish";
   const crossedUp = (level) =>
@@ -117,6 +149,49 @@ function evaluatePreset(side, preset, payload) {
               (rsi != null && rsi >= overbought) &&
               (summary.supertrendBreakDown || isBearish),
             reason: `RSI overbought with bearish Supertrend context`,
+            signal: summary,
+          };
+    case "stoch_rsi_reversal":
+      // Stoch RSI is computed locally from the RSI series; null when insufficient history.
+      if (stochRsi == null) {
+        return {
+          confirmed: false,
+          reason: `StochRSI unavailable (insufficient RSI history)`,
+          signal: summary,
+        };
+      }
+      return side === "entry"
+        ? {
+            confirmed: stochRsi <= stochOversold,
+            reason: `StochRSI ${stochRsi.toFixed(2)} <= oversold ${stochOversold}`,
+            signal: summary,
+          }
+        : {
+            confirmed: stochRsi >= stochOverbought,
+            reason: `StochRSI ${stochRsi.toFixed(2)} >= overbought ${stochOverbought}`,
+            signal: summary,
+          };
+    case "stoch_rsi_plus_supertrend":
+      if (stochRsi == null) {
+        return {
+          confirmed: false,
+          reason: `StochRSI unavailable (insufficient RSI history)`,
+          signal: summary,
+        };
+      }
+      return side === "entry"
+        ? {
+            confirmed:
+              stochRsi <= stochOversold &&
+              (summary.supertrendBreakUp || isBullish),
+            reason: `StochRSI ${stochRsi.toFixed(2)} oversold with bullish Supertrend context`,
+            signal: summary,
+          }
+        : {
+            confirmed:
+              stochRsi >= stochOverbought &&
+              (summary.supertrendBreakDown || isBearish),
+            reason: `StochRSI ${stochRsi.toFixed(2)} overbought with bearish Supertrend context`,
             signal: summary,
           };
     case "supertrend_or_rsi":

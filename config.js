@@ -302,6 +302,9 @@ export const config = {
     candles: indicatorUserConfig.candles ?? 298,
     rsiOversold: indicatorUserConfig.rsiOversold ?? 30,
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
+    stochRsiLength: indicatorUserConfig.stochRsiLength ?? 14,
+    stochRsiOversold: indicatorUserConfig.stochRsiOversold ?? 20,
+    stochRsiOverbought: indicatorUserConfig.stochRsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
   },
 };

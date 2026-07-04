@@ -611,6 +611,9 @@ const toolMap = {
       indicatorCandles: ["indicators", "candles", ["chartIndicators", "candles"]],
       rsiOversold: ["indicators", "rsiOversold", ["chartIndicators", "rsiOversold"]],
       rsiOverbought: ["indicators", "rsiOverbought", ["chartIndicators", "rsiOverbought"]],
+      stochRsiLength: ["indicators", "stochRsiLength", ["chartIndicators", "stochRsiLength"]],
+      stochRsiOversold: ["indicators", "stochRsiOversold", ["chartIndicators", "stochRsiOversold"]],
+      stochRsiOverbought: ["indicators", "stochRsiOverbought", ["chartIndicators", "stochRsiOverbought"]],
       requireAllIntervals: ["indicators", "requireAllIntervals", ["chartIndicators", "requireAllIntervals"]],
     };
 

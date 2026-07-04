@@ -106,6 +106,9 @@
     "candles": 298,
     "rsiOversold": 30,
     "rsiOverbought": 80,
+    "stochRsiLength": 14,
+    "stochRsiOversold": 20,
+    "stochRsiOverbought": 80,
     "requireAllIntervals": false
   },
   "telegramChatId": "",
