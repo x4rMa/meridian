@@ -420,8 +420,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change) | deposit: SOL only (amount_y, amount_x=0)`
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
-    // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
+    // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s.
+    // Surface the error rather than swallowing it — a silent null makes a hung/failed
+    // screener look identical to "no candidates", which hides outages for hours.
+    const topCandidates = await getTopCandidates({ limit: 10 }).catch((error) => {
+      log("cron_error", `getTopCandidates failed: ${error.message}`);
+      return null;
+    });
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
 

@@ -332,7 +332,10 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
     `&timeframe=${timeframe}` +
     `&category=${category}`;
 
-  const res = await fetch(url);
+  // 20s hard timeout — without this a hung API connection stalls the screener
+  // forever (the .catch(() => null) in runScreeningCycle can't help if the
+  // promise never settles). AbortSignal.timeout lands a rejection instead.
+  const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
 
   if (!res.ok) {
     throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
@@ -574,7 +577,9 @@ function buildDiscoveryFilters(s, tier) {
     "quote_token_has_critical_warnings=false",
     s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
     "base_token_has_high_single_ownership=false",
-    "pool_type=dlmm,damm_v2",
+    // NOTE: pool_type is NOT included here. The Meteora pool-discovery API does
+    // not support comma-OR (`pool_type=dlmm,damm_v2` returns 0 pools). fetchTierPools
+    // issues one fetch per pool_type (dlmm, damm_v2) and merges the results.
     `base_token_market_cap>=${minMcap}`,
     `base_token_market_cap<=${maxMcap}`,
     `base_token_holders>=${minHolders}`,
@@ -604,14 +609,33 @@ async function fetchTierPools(s, tier, page_size, { timeframe, category } = {}) 
   const tf = timeframe || s.timeframe;
   const cat = category || s.category;
   const filters = buildDiscoveryFilters(s, tier);
-  const data = await fetchPoolDiscoveryPage({
-    page_size,
-    filters,
-    timeframe: tf,
-    category: cat,
-  });
-
-  let rawPools = Array.isArray(data.data) ? data.data : [];
+  // The pool-discovery API rejects comma-OR (`pool_type=dlmm,damm_v2` → 0 pools),
+  // so fetch each pool_type separately and merge. Parallel to keep latency flat.
+  const POOL_TYPES = ["dlmm", "damm_v2"];
+  const pages = await Promise.all(
+    POOL_TYPES.map((pt) =>
+      fetchPoolDiscoveryPage({
+        page_size,
+        filters: `pool_type=${pt}&&${filters}`,
+        timeframe: tf,
+        category: cat,
+      }).catch((error) => {
+        log("screening", `${tier} pool_type=${pt} fetch failed: ${error.message}`);
+        return { data: [] };
+      })
+    )
+  );
+  // Dedup by pool_address (a pool won't appear under both types, but be safe).
+  const seen = new Set();
+  let rawPools = [];
+  for (const page of pages) {
+    for (const pool of Array.isArray(page.data) ? page.data : []) {
+      if (pool.pool_address && !seen.has(pool.pool_address)) {
+        seen.add(pool.pool_address);
+        rawPools.push(pool);
+      }
+    }
+  }
 
   // Discord signals only merge into the degen tier.
   if (tier === "degen" && config.screening.useDiscordSignals) {
@@ -678,7 +702,7 @@ async function fetchTierPools(s, tier, page_size, { timeframe, category } = {}) 
   // Tag each surviving pool with the tier that admitted it.
   for (const pool of thresholdedRawPools) pool._tier = tier;
 
-  return { rawPools: thresholdedRawPools, filteredExamples, total: data.total };
+  return { rawPools: thresholdedRawPools, filteredExamples, total: rawPools.length };
 }
 
 /**
