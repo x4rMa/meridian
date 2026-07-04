@@ -62,6 +62,96 @@ function poolDetailBinStep(pool) {
   return numberOrNull(pool?.dlmm_params?.bin_step ?? pool?.pool_config?.bin_step);
 }
 
+/**
+ * Tier-aware bin_step bounds. Midcap candidates (established high-fee pools) are
+ * allowed narrower bin_steps (40-150) than degen (80-125). The tier is passed
+ * through from the candidate block via the deploy_position.tier arg.
+ */
+function binStepBoundsForTier(tier) {
+  const s = config.screening;
+  if (tier === "midcap") {
+    return {
+      min: numberOrNull(s.midcapMinBinStep) ?? numberOrNull(s.minBinStep) ?? 80,
+      max: numberOrNull(s.midcapMaxBinStep) ?? numberOrNull(s.maxBinStep) ?? 125,
+    };
+  }
+  return {
+    min: numberOrNull(s.minBinStep) ?? 80,
+    max: numberOrNull(s.maxBinStep) ?? 125,
+  };
+}
+
+/**
+ * Tier-aware TVL bounds. Midcap candidates are established pools with higher
+ * TVL (up to midcapMaxTvl, default 1m) than the degen envelope (maxTvl, default 250k).
+ */
+function tvlBoundsForTier(tier) {
+  const s = config.screening;
+  if (tier === "midcap") {
+    return {
+      min: numberOrNull(s.midcapMinTvl) ?? numberOrNull(s.minTvl) ?? 20000,
+      max: numberOrNull(s.midcapMaxTvl) ?? numberOrNull(s.maxTvl) ?? 250000,
+    };
+  }
+  return {
+    min: numberOrNull(s.minTvl) ?? 20000,
+    max: numberOrNull(s.maxTvl) ?? 250000,
+  };
+}
+
+/**
+ * Tier-aware fee gate for deploy safety checks. Mirrors the screening fee gate:
+ * - Degen: pure ratio floor (fee_active_tvl_ratio >= minFeeActiveTvlRatio).
+ * - Midcap: ratio OR absolute 24h-fee floor. Fetches the real 24h fee from the
+ *   pool discovery API so the absolute floor is judged accurately (a 5m slice
+ *   extrapolation undercounts by 4-5×).
+ */
+async function checkDeployFeeGate(detail, tier) {
+  const s = config.screening;
+  const ratio = numberOrNull(detail?.fee_active_tvl_ratio);
+
+  if (tier !== "midcap") {
+    const minRatio = numberOrNull(s.minFeeActiveTvlRatio);
+    if (minRatio != null && minRatio > 0 && (ratio == null || ratio < minRatio)) {
+      return { pass: false, reason: `Pool fee/active-TVL ${ratio ?? "unknown"} is below configured minFeeActiveTvlRatio ${minRatio} (tier: degen).` };
+    }
+    return { pass: true };
+  }
+
+  // Midcap: OR-gate.
+  const minRatio = numberOrNull(s.midcapMinFeeActiveTvlRatio) ?? numberOrNull(s.minFeeActiveTvlRatio);
+  if (minRatio != null && ratio != null && ratio >= minRatio) {
+    return { pass: true };
+  }
+  // Ratio failed — check the absolute 24h fee floor with the real 24h fee.
+  const minFee24hUsd = numberOrNull(s.midcapMinFee24hUsd);
+  if (minFee24hUsd != null && minFee24hUsd > 0) {
+    let fee24h = numberOrNull(detail?.fee_24h);
+    if (!fee24h || fee24h <= 0) {
+      // Fetch the real 24h fee — the 5m extrapolation is too noisy for a deploy gate.
+      try {
+        const detail24h = await fetchFreshPoolDetail(detail?.pool_address, "24h");
+        fee24h = numberOrNull(detail24h?.fee);
+      } catch { /* fall through to estimate */ }
+    }
+    if (!fee24h || fee24h <= 0) {
+      // Last resort: linear extrapolation from the window fee.
+      const feeWindow = numberOrNull(detail?.fee) ?? 0;
+      const tfMinutes = TIMEFRAME_MINUTES[s.timeframe] || 5;
+      fee24h = feeWindow * (1440 / tfMinutes);
+    }
+    if (fee24h != null && fee24h >= minFee24hUsd) {
+      return { pass: true };
+    }
+    return { pass: false, reason: `Pool fee/active-TVL ${ratio ?? "unknown"} below ${minRatio} AND 24h fee $${fee24h != null ? fee24h.toFixed(0) : "unknown"} below $${minFee24hUsd} (tier: midcap).` };
+  }
+  // No absolute floor configured — fall back to pure ratio for midcap too.
+  if (minRatio != null && minRatio > 0 && (ratio == null || ratio < minRatio)) {
+    return { pass: false, reason: `Pool fee/active-TVL ${ratio ?? "unknown"} is below configured minFeeActiveTvlRatio ${minRatio} (tier: midcap, no absolute floor set).` };
+  }
+  return { pass: true };
+}
+
 function poolDetailFeeActiveTvlRatio(pool) {
   return numberOrNull(pool?.fee_active_tvl_ratio);
 }
@@ -93,37 +183,32 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const tvl = poolDetailTvl(detail);
-  const minTvl = numberOrNull(config.screening.minTvl);
-  const maxTvl = numberOrNull(config.screening.maxTvl);
+  const tvlBounds = tvlBoundsForTier(args.tier);
   if (tvl == null) {
     return {
       pass: false,
       reason: "Could not verify pool TVL before deploy.",
     };
   }
-  if (minTvl != null && minTvl > 0 && tvl < minTvl) {
+  if (tvlBounds.min != null && tvlBounds.min > 0 && tvl < tvlBounds.min) {
     return {
       pass: false,
-      reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
+      reason: `Pool TVL $${tvl} is below configured minTvl $${tvlBounds.min} (tier: ${args.tier || "degen"}).`,
     };
   }
-  if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
+  if (tvlBounds.max != null && tvlBounds.max > 0 && tvl > tvlBounds.max) {
     return {
       pass: false,
-      reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
+      reason: `Pool TVL $${tvl} is above configured maxTvl $${tvlBounds.max} (tier: ${args.tier || "degen"}).`,
     };
   }
 
   const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
-  const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
-  if (
-    minFeeActiveTvlRatio != null &&
-    minFeeActiveTvlRatio > 0 &&
-    (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
-  ) {
+  const feeGate = await checkDeployFeeGate(detail, args.tier);
+  if (!feeGate.pass) {
     return {
       pass: false,
-      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
+      reason: feeGate.reason,
     };
   }
 
@@ -149,18 +234,17 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const actualBinStep = poolDetailBinStep(detail);
-  const minStep = numberOrNull(config.screening.minBinStep);
-  const maxStep = numberOrNull(config.screening.maxBinStep);
-  if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
+  const bounds = binStepBoundsForTier(args.tier);
+  if (actualBinStep != null && bounds.min != null && actualBinStep < bounds.min) {
     return {
       pass: false,
-      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
+      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${bounds.min} (tier: ${args.tier || "degen"}).`,
     };
   }
-  if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
+  if (actualBinStep != null && bounds.max != null && actualBinStep > bounds.max) {
     return {
       pass: false,
-      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
+      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${bounds.max} (tier: ${args.tier || "degen"}).`,
     };
   }
 
@@ -216,6 +300,9 @@ function normalizeConfigValue(key, value) {
     "solMode",
     "darwinEnabled",
     "lpAgentRelayEnabled",
+    "midcapEnabled",
+    "midcapBypassIndicators",
+    "midcapBypassTimingFilters",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
   const stringKeys = new Set([
@@ -369,6 +456,23 @@ const toolMap = {
       blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
+      minDrawdownFromAthPct: ["screening", "minDrawdownFromAthPct"],
+      requireVolumeAccelerating: ["screening", "requireVolumeAccelerating"],
+      // mid-cap tier (flat keys under screening)
+      midcapEnabled: ["screening", "midcapEnabled"],
+      midcapMaxTvl: ["screening", "midcapMaxTvl"],
+      midcapMaxTokenAgeHours: ["screening", "midcapMaxTokenAgeHours"],
+      midcapMinBinStep: ["screening", "midcapMinBinStep"],
+      midcapMaxBinStep: ["screening", "midcapMaxBinStep"],
+      midcapMinFeeActiveTvlRatio: ["screening", "midcapMinFeeActiveTvlRatio"],
+      midcapMinFee24hUsd: ["screening", "midcapMinFee24hUsd"],
+      midcapMinOrganic: ["screening", "midcapMinOrganic"],
+      midcapMinHolders: ["screening", "midcapMinHolders"],
+      midcapMinMcap: ["screening", "midcapMinMcap"],
+      midcapMaxMcap: ["screening", "midcapMaxMcap"],
+      midcapMinTvl: ["screening", "midcapMinTvl"],
+      midcapBypassIndicators: ["screening", "midcapBypassIndicators"],
+      midcapBypassTimingFilters: ["screening", "midcapBypassTimingFilters"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
       // management
@@ -731,13 +835,12 @@ async function runSafetyChecks(name, args) {
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
 
-      // Reject pools with bin_step out of configured range
-      const minStep = config.screening.minBinStep;
-      const maxStep = config.screening.maxBinStep;
-      if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
+      // Reject pools with bin_step out of the tier-specific configured range
+      const bounds = binStepBoundsForTier(args.tier);
+      if (args.bin_step != null && (args.bin_step < bounds.min || args.bin_step > bounds.max)) {
         return {
           pass: false,
-          reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
+          reason: `bin_step ${args.bin_step} is outside the allowed range of [${bounds.min}-${bounds.max}] (tier: ${args.tier || "degen"}).`,
         };
       }
 

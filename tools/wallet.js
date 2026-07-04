@@ -66,8 +66,16 @@ export async function getWalletBalances() {
 
   const HELIUS_KEY = process.env.HELIUS_API_KEY;
   if (!HELIUS_KEY) {
-    log("wallet_error", "HELIUS_API_KEY not set in .env");
-    return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
+    // Fall back to a direct RPC getBalance so the screener's SOL check still works
+    // when Helius isn't configured. USD pricing and token list are unavailable here.
+    try {
+      const lamports = await getConnection().getBalance(new PublicKey(walletAddress));
+      const sol = Math.round((lamports / LAMPORTS_PER_SOL) * 1e6) / 1e6;
+      return { wallet: walletAddress, sol, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0 };
+    } catch (e) {
+      log("wallet_error", `RPC balance fetch failed: ${e.message}`);
+      return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: e.message };
+    }
   }
 
   try {

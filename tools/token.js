@@ -69,6 +69,16 @@ export async function getTokenInfo({ query }) {
       buyers: t.stats1h.numOrganicBuyers,
       net_buyers: t.stats1h.numNetBuyers,
     } : null,
+    // 6h window — used to estimate drawdown from recent high (ATH-proximity filter).
+    // If price_change < 0, token has pulled back |X|% from 6h ago (safer entry).
+    // If price_change > 0, token is at/near its 6h high (rug risk — near ATH).
+    stats_6h_price_change: t.stats6h?.priceChange != null
+      ? Number(t.stats6h.priceChange.toFixed(2))
+      : null,
+    // 5m window volume — used to detect volume acceleration vs the 1h average run-rate.
+    stats_5m_volume: t.stats5m?.buyVolume != null || t.stats5m?.sellVolume != null
+      ? Number(((t.stats5m?.buyVolume || 0) + (t.stats5m?.sellVolume || 0)).toFixed(2))
+      : null,
     // stats_24h omitted — misleading for short-timeframe LP (reflects full pump history)
     stats_24h_net_buyers: t.stats24h ? t.stats24h.numNetBuyers : null, // keep only net buyer direction
   }));

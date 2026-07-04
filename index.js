@@ -443,9 +443,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
     }
 
-    // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
+    // Hard filters after token recon — block launchpads, excessive bot holders, and near-ATH tokens
     const filteredOut = [];
+    const minDrawdown = config.screening.minDrawdownFromAthPct;
+    const requireVolAccel = config.screening.requireVolumeAccelerating;
+    const midcapBypassTiming = config.screening.midcapBypassTimingFilters !== false;
     const passing = allCandidates.filter(({ pool, ti }) => {
+      // Midcap entries are fee-yield plays on established pools — the ATH-proximity and
+      // volume-acceleration gates are momentum-timing signals that don't apply to them.
+      const isMidcapTiming = midcapBypassTiming && pool.tier === "midcap";
       const launchpad = ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
@@ -463,6 +469,39 @@ export async function runScreeningCycle({ silent = false } = {}) {
         log("screening", `Bot-holder filter: dropped ${pool.name} — bots ${botPct}% > ${maxBotHoldersPct}%`);
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
+      }
+      const top10Pct = ti?.audit?.top_holders_pct;
+      const maxTop10Pct = config.screening.maxTop10Pct;
+      if (top10Pct != null && maxTop10Pct != null && top10Pct > maxTop10Pct) {
+        log("screening", `Top10-holder filter: dropped ${pool.name} — top10 ${top10Pct}% > ${maxTop10Pct}%`);
+        filteredOut.push({ name: pool.name, reason: `top10 concentration ${top10Pct}% > ${maxTop10Pct}%` });
+        return false;
+      }
+      // ATH-proximity filter: estimate drawdown from 6h-window high using stats6h.priceChange.
+      // Positive change → token is at/near its recent high (rug risk); negative → pulled back (safer).
+      if (!isMidcapTiming && minDrawdown != null && ti?.stats_6h_price_change != null) {
+        const change = ti.stats_6h_price_change;
+        // drawdown ≈ -change when change < 0 (price fell from 6h ago); 0 when change >= 0 (at window high)
+        const drawdown = change < 0 ? -change : 0;
+        if (drawdown < minDrawdown) {
+          log("screening", `ATH filter: dropped ${pool.name} — ${drawdown.toFixed(1)}% drawdown from 6h high < ${minDrawdown}% min (change ${change}%)`);
+          filteredOut.push({ name: pool.name, reason: `near ATH: ${drawdown.toFixed(1)}% drawdown < ${minDrawdown}% min` });
+          return false;
+        }
+      }
+      // Volume-acceleration filter: current 5m run-rate must be 1.3×+ the 1h average.
+      // 5m volume × 12 = hourly run-rate; compare to 1h volume. Catches real-time interest spikes.
+      if (!isMidcapTiming && requireVolAccel && ti?.stats_5m_volume != null && ti?.stats_1h?.buy_vol != null && ti?.stats_1h?.sell_vol != null) {
+        const hourlyRunRate = ti.stats_5m_volume * 12;
+        const last1hVol = Number(ti.stats_1h.buy_vol) + Number(ti.stats_1h.sell_vol);
+        if (last1hVol > 0) {
+          const ratio = hourlyRunRate / last1hVol;
+          if (ratio < 1.3) {
+            log("screening", `Volume filter: dropped ${pool.name} — 5m run-rate ${hourlyRunRate.toFixed(0)}/h vs 1h ${last1hVol.toFixed(0)} (ratio ${ratio.toFixed(2)} < 1.3)`);
+            filteredOut.push({ name: pool.name, reason: `volume not accelerating: 5m run-rate ${ratio.toFixed(2)}× 1h avg < 1.3×` });
+            return false;
+          }
+        }
       }
       return true;
     });
@@ -535,8 +574,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
         : null;
 
       const block = [
-        `POOL: ${pool.name} (${pool.pool})`,
-        `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
+        `POOL: ${pool.name} (${pool.pool}) [tier: ${pool.tier || "degen"}]`,
+        `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, fee_24h=$${pool.fee_24h ?? "?"}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
@@ -583,6 +622,7 @@ STEPS:
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
+   pass deploy_position.tier = the candidate's tier (from the [tier: ...] tag in its block) so the bin_step safety check uses the correct range.
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
 4. Report in this exact format (no tables, no extra sections):
@@ -741,11 +781,13 @@ Summarize the current portfolio health, total fees earned, and performance of al
         if (exit) { signal = exit.action; reason = exit.reason; }
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
 
-        // Require N consecutive confirming ticks before acting.
-        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
+        // Require N consecutive confirming ticks before acting — except a hard stop loss,
+        // which must fire on the first tick to limit downside in a fast rug.
+        const ticksNeeded = signal === "STOP_LOSS" ? 1 : confirmTicks;
+        const { fire } = registerExitSignal(p.position, signal, ticksNeeded);
         if (!signal || !fire) continue;
 
-        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — closing directly`);
+        log("state", `[PnL poll] ${signal} confirmed (${ticksNeeded} ticks): ${p.pair} — ${reason} — closing directly`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {

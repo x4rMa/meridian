@@ -133,7 +133,7 @@ PRIORITY ORDER for strategy and bins:
 
 HARD RULES:
 - Never use 'curve'.
-- Bin Step: Only deploy in pools with bin_step between 80 and 125.
+- Bin Step: the allowed range depends on the candidate's tier. Degen tier pools: bin_step 80-125. Midcap tier pools: bin_step 40-150 (narrower bins are acceptable for established high-fee pools). Pass the tier field so the safety check applies the right range.
 - Volatility must be positive. If volatility is 0, null, or missing, do not deploy.
 - Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
 - For single-side SOL deploys (amount_y only, amount_x=0), do not request upside exposure:
@@ -186,6 +186,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
             description: "Optional human-friendly upside range in percent above the current active price. Do not use this for single-side SOL deploys."
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
+          tier: { type: "string", enum: ["degen", "midcap"], description: "Screening tier that admitted this candidate. Pass it through from the candidate block so the deploy safety check uses the correct bin_step range." },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
           bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
           base_fee: { type: "number", description: "Pool base fee percentage (from discover_pools)" },

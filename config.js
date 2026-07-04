@@ -98,6 +98,35 @@ export const config = {
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    minDrawdownFromAthPct: u.minDrawdownFromAthPct ?? null, // null = disabled. Reject tokens nearer than X% to their 6h-window high (rug risk).
+    requireVolumeAccelerating: u.requireVolumeAccelerating ?? false, // require 5m volume run-rate > 1.3× the 1h average
+
+    // ─── Mid-cap tier ────────────────────────────────────────────
+    // A second screening profile run alongside the degen profile each cycle.
+    // Catches established pools (higher TVL/age, lower bin_step) that the degen
+    // ratio-gate structurally rejects. The absolute fee floor (minFee24hUsd) is
+    // the OR-alternative to minFeeActiveTvlRatio: a pool passes the fee gate if
+    // EITHER its fee/TVL ratio clears the bar OR its 24h-estimated fees clear
+    // the USD floor. Defaults are conservative; set midcapEnabled=true to use.
+    midcapEnabled:           u.midcapEnabled           ?? false,
+    midcapMaxTvl:            u.midcapMaxTvl            ?? 1_000_000,
+    midcapMaxTokenAgeHours:  u.midcapMaxTokenAgeHours  ?? 720,   // ~30 days
+    midcapMinBinStep:        u.midcapMinBinStep        ?? 40,
+    midcapMaxBinStep:        u.midcapMaxBinStep        ?? 150,
+    midcapMinFeeActiveTvlRatio: u.midcapMinFeeActiveTvlRatio ?? 0.01, // loose ratio dust-floor
+    midcapMinFee24hUsd:      u.midcapMinFee24hUsd      ?? 5000,  // absolute USD fee floor (OR with ratio)
+    midcapMinOrganic:        u.midcapMinOrganic        ?? 60,
+    midcapMinHolders:        u.midcapMinHolders        ?? 3000,
+    midcapMinMcap:           u.midcapMinMcap           ?? 500_000,
+    midcapMaxMcap:           u.midcapMaxMcap           ?? 50_000_000,
+    midcapMinTvl:            u.midcapMinTvl            ?? 100_000,
+    // Midcap entries are fee-yield plays on established pools, not momentum trades —
+    // the 5m chart-confirmation gate (supertrend_break etc.) is the wrong signal for them.
+    // When true, midcap-tier candidates skip the indicator gate entirely; degen still uses it.
+    midcapBypassIndicators:  u.midcapBypassIndicators  ?? true,
+    // Same logic for the ATH-proximity (minDrawdownFromAthPct) and volume-acceleration
+    // (requireVolumeAccelerating) gates — both are momentum-timing signals. Bypassed for midcap.
+    midcapBypassTimingFilters: u.midcapBypassTimingFilters ?? true,
   },
 
   // ─── Position Management ────────────────
@@ -317,11 +346,28 @@ export function reloadScreeningThresholds() {
     if (fresh.category          != null) s.category          = fresh.category;
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
+    if (fresh.minDrawdownFromAthPct !== undefined) s.minDrawdownFromAthPct = fresh.minDrawdownFromAthPct;
+    if (fresh.requireVolumeAccelerating !== undefined) s.requireVolumeAccelerating = fresh.requireVolumeAccelerating;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    // Mid-cap tier (flat keys under screening)
+    if (fresh.midcapEnabled              !== undefined) s.midcapEnabled              = fresh.midcapEnabled;
+    if (fresh.midcapMaxTvl               != null) s.midcapMaxTvl               = fresh.midcapMaxTvl;
+    if (fresh.midcapMaxTokenAgeHours     != null) s.midcapMaxTokenAgeHours     = fresh.midcapMaxTokenAgeHours;
+    if (fresh.midcapMinBinStep           != null) s.midcapMinBinStep           = fresh.midcapMinBinStep;
+    if (fresh.midcapMaxBinStep           != null) s.midcapMaxBinStep           = fresh.midcapMaxBinStep;
+    if (fresh.midcapMinFeeActiveTvlRatio != null) s.midcapMinFeeActiveTvlRatio = fresh.midcapMinFeeActiveTvlRatio;
+    if (fresh.midcapMinFee24hUsd         != null) s.midcapMinFee24hUsd         = fresh.midcapMinFee24hUsd;
+    if (fresh.midcapMinOrganic           != null) s.midcapMinOrganic           = fresh.midcapMinOrganic;
+    if (fresh.midcapMinHolders           != null) s.midcapMinHolders           = fresh.midcapMinHolders;
+    if (fresh.midcapMinMcap              != null) s.midcapMinMcap              = fresh.midcapMinMcap;
+    if (fresh.midcapMaxMcap              != null) s.midcapMaxMcap              = fresh.midcapMaxMcap;
+    if (fresh.midcapMinTvl               != null) s.midcapMinTvl               = fresh.midcapMinTvl;
+  if (fresh.midcapBypassIndicators     !== undefined) s.midcapBypassIndicators = fresh.midcapBypassIndicators;
+  if (fresh.midcapBypassTimingFilters  !== undefined) s.midcapBypassTimingFilters = fresh.midcapBypassTimingFilters;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

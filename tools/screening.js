@@ -41,6 +41,78 @@ export function scoreCandidate(pool) {
 }
 
 /**
+ * 24h fee revenue (USD) for the fee gate.
+ * Prefers the real 24h fee fetched from the API (pool.fee_24h, populated by
+ * enrichFee24hForPools). Falls back to a linear extrapolation from the window-
+ * period fee — but that extrapolation is noisy on short timeframes (a single
+ * quiet 5m slice can undercount real 24h fees by 4-5×), so the real value is
+ * strongly preferred whenever available.
+ */
+export function estimateFee24hUsd(pool) {
+  const fee24h = Number(pool?.fee_24h);
+  if (Number.isFinite(fee24h) && fee24h > 0) return fee24h;
+  const feeWindow = Number(pool?.fee_window ?? pool?.fee ?? 0);
+  if (!Number.isFinite(feeWindow) || feeWindow <= 0) return 0;
+  const tfMinutes = TIMEFRAME_MINUTES[config.screening.timeframe] || DEGEN_REFERENCE_MINUTES;
+  const scale = 1440 / tfMinutes;
+  return feeWindow * scale;
+}
+
+/**
+ * Fetch the real 24h fee for each pool that didn't pass the ratio gate.
+ * The linear extrapolation from a 5m slice undercounts real 24h fees badly on
+ * short timeframes (a quiet slice can understate by 4-5×), so the absolute-fee
+ * gate needs the real number to judge fairly. Pools that already passed the
+ * ratio gate skip this fetch (they're in regardless of the fee floor).
+ */
+async function enrichFee24hForPools(rawPools, s, tier) {
+  if (!Array.isArray(rawPools) || rawPools.length === 0) return;
+  if (tier !== "midcap") return; // only the midcap tier uses the absolute-fee floor
+  const needsFetch = rawPools.filter((pool) => {
+    const ratio = Number(pool?.fee_active_tvl_ratio);
+    const ratioFloor = Number(s.midcapMinFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio);
+    return !(Number.isFinite(ratio) && Number.isFinite(ratioFloor) && ratio >= ratioFloor);
+  });
+  if (needsFetch.length === 0) return;
+
+  const results = await Promise.allSettled(
+    needsFetch.map((pool) =>
+      fetchPoolDiscoveryDetail({ poolAddress: pool.pool_address, timeframe: "24h" })
+        .then((detail) => ({ poolAddress: pool.pool_address, fee: numeric(detail?.fee) }))
+    )
+  );
+  let enriched = 0;
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    const { poolAddress, fee } = result.value;
+    if (!Number.isFinite(fee) || fee <= 0) continue;
+    const pool = rawPools.find((p) => p.pool_address === poolAddress);
+    if (pool) { pool.fee_24h = fee; enriched++; }
+  }
+  if (enriched > 0) log("screening", `midcap: fetched real 24h fee for ${enriched}/${needsFetch.length} ratio-failed pool(s)`);
+}
+
+/**
+ * Fee gate: OR-logic between a ratio floor and an absolute USD floor.
+ * A pool passes if EITHER:
+ *   - fee_active_tvl_ratio >= minFeeActiveTvlRatio (ratio gate — catches efficient small pools), OR
+ *   - estimatedFee24hUsd    >= minFee24hUsd       (absolute floor — catches fat-fee large pools
+ *                                                  that the ratio gate structurally rejects)
+ * minFee24hUsd=null disables the absolute floor (pure ratio mode, the legacy behavior).
+ */
+export function passesFeeGate(pool, { minFeeActiveTvlRatio, minFee24hUsd = null }) {
+  const ratio = Number(pool?.fee_active_tvl_ratio);
+  if (Number.isFinite(ratio) && Number.isFinite(minFeeActiveTvlRatio) && ratio >= minFeeActiveTvlRatio) {
+    return true;
+  }
+  if (minFee24hUsd != null && Number.isFinite(minFee24hUsd) && minFee24hUsd > 0) {
+    const fee24h = estimateFee24hUsd(pool);
+    if (fee24h >= minFee24hUsd) return true;
+  }
+  return false;
+}
+
+/**
  * Degen Score — a pool's efficiency relative to its liquidity, on a 0..100 scale.
  * Geometric mean of four liquidity-relative sub-scores so a HIGH score requires balance
  * across all four (a pool spiking one metric can't dominate):
@@ -131,7 +203,7 @@ function getVolatilityTimeframe(sourceTimeframe) {
   return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
 }
 
-function getRawPoolScreeningRejectReason(pool, s) {
+function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};
   const binStep = numeric(pool?.dlmm_params?.bin_step);
@@ -146,6 +218,23 @@ function getRawPoolScreeningRejectReason(pool, s) {
   const launchpad = getPoolLaunchpad(pool);
   const createdAt = numeric(base?.created_at);
 
+  // Tier-specific thresholds: midcap overrides the degen envelope; degen uses s.* directly.
+  const isMidcap = tier === "midcap";
+  const minMcap        = isMidcap ? (s.midcapMinMcap ?? s.minMcap)            : s.minMcap;
+  const maxMcap        = isMidcap ? (s.midcapMaxMcap ?? s.maxMcap)            : s.maxMcap;
+  const minHolders     = isMidcap ? (s.midcapMinHolders ?? s.minHolders)      : s.minHolders;
+  const minTvl         = isMidcap ? (s.midcapMinTvl ?? s.minTvl)              : s.minTvl;
+  const maxTvl         = isMidcap ? (s.midcapMaxTvl ?? s.maxTvl)              : s.maxTvl;
+  const minBinStep     = isMidcap ? (s.midcapMinBinStep ?? s.minBinStep)      : s.minBinStep;
+  const maxBinStep     = isMidcap ? (s.midcapMaxBinStep ?? s.maxBinStep)      : s.maxBinStep;
+  const minOrganic     = isMidcap ? (s.midcapMinOrganic ?? s.minOrganic)      : s.minOrganic;
+  const minQuoteOrganic = isMidcap ? (s.midcapMinOrganic ?? s.minQuoteOrganic): s.minQuoteOrganic;
+  const maxTokenAgeHours = isMidcap ? (s.midcapMaxTokenAgeHours ?? s.maxTokenAgeHours) : s.maxTokenAgeHours;
+  // Fee gate: degen = pure ratio (legacy); midcap = ratio OR absolute USD floor.
+  const feeGateOpts = isMidcap
+    ? { minFeeActiveTvlRatio: s.midcapMinFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, minFee24hUsd: s.midcapMinFee24hUsd }
+    : { minFeeActiveTvlRatio: s.minFeeActiveTvlRatio };
+
   if (s.excludeHighSupplyConcentration && pool?.base_token_has_high_supply_concentration === true) {
     return "base token has high supply concentration";
   }
@@ -154,25 +243,27 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
   if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
 
-  if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
-  if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
-  if (holders == null || holders < s.minHolders) return `holders ${holders ?? "unknown"} below minHolders ${s.minHolders}`;
+  if (mcap == null || mcap < minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${minMcap}`;
+  if (mcap > maxMcap) return `mcap ${mcap} above maxMcap ${maxMcap}`;
+  if (holders == null || holders < minHolders) return `holders ${holders ?? "unknown"} below minHolders ${minHolders}`;
   if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
-  if (tvl == null || tvl < s.minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${s.minTvl}`;
-  if (s.maxTvl != null && tvl > s.maxTvl) return `TVL ${tvl} above maxTvl ${s.maxTvl}`;
-  if (binStep == null || binStep < s.minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${s.minBinStep}`;
-  if (binStep > s.maxBinStep) return `bin_step ${binStep} above maxBinStep ${s.maxBinStep}`;
-  if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
-    return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
+  if (tvl == null || tvl < minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${minTvl}`;
+  if (maxTvl != null && tvl > maxTvl) return `TVL ${tvl} above maxTvl ${maxTvl}`;
+  if (binStep == null || binStep < minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${minBinStep}`;
+  if (binStep > maxBinStep) return `bin_step ${binStep} above maxBinStep ${maxBinStep}`;
+  if (!passesFeeGate(pool, feeGateOpts)) {
+    const fee24h = estimateFee24hUsd(pool);
+    const floorStr = feeGateOpts.minFee24hUsd != null ? ` OR fee_24h $${fee24h.toFixed(0)} < $${feeGateOpts.minFee24hUsd}` : "";
+    return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below ${feeGateOpts.minFeeActiveTvlRatio}${floorStr}`;
   }
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
   }
-  if (baseOrganic == null || baseOrganic < s.minOrganic) {
-    return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
+  if (baseOrganic == null || baseOrganic < minOrganic) {
+    return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${minOrganic}`;
   }
-  if (quoteOrganic == null || quoteOrganic < s.minQuoteOrganic) {
-    return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${s.minQuoteOrganic}`;
+  if (quoteOrganic == null || quoteOrganic < minQuoteOrganic) {
+    return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${minQuoteOrganic}`;
   }
   if (
     pool?.discord_signal &&
@@ -190,9 +281,9 @@ function getRawPoolScreeningRejectReason(pool, s) {
     const maxCreatedAt = Date.now() - s.minTokenAgeHours * 3_600_000;
     if (createdAt == null || createdAt > maxCreatedAt) return `token age below minTokenAgeHours ${s.minTokenAgeHours}`;
   }
-  if (s.maxTokenAgeHours != null) {
-    const minCreatedAt = Date.now() - s.maxTokenAgeHours * 3_600_000;
-    if (createdAt == null || createdAt < minCreatedAt) return `token age above maxTokenAgeHours ${s.maxTokenAgeHours}`;
+  if (maxTokenAgeHours != null) {
+    const minCreatedAt = Date.now() - maxTokenAgeHours * 3_600_000;
+    if (createdAt == null || createdAt < minCreatedAt) return `token age above maxTokenAgeHours ${maxTokenAgeHours}`;
   }
   return null;
 }
@@ -427,47 +518,74 @@ async function refreshDiscordOnlyPools(pools, timeframe) {
 }
 
 /**
- * Fetch pools from the Meteora Pool Discovery API.
- * Returns condensed data optimized for LLM consumption (saves tokens).
+ * Build the Meteora Pool Discovery API filter string for a given tier.
+ * Degen = tight envelope (legacy). Midcap = loose ratio dust-floor on the API
+ * (so fat-fee large pools pass the API), with the absolute-fee OR gate applied
+ * post-fetch in getRawPoolScreeningRejectReason.
  */
-export async function discoverPools({
-  page_size = 50,
-} = {}) {
-  const s = config.screening;
-  const filters = [
+function buildDiscoveryFilters(s, tier) {
+  const isMidcap = tier === "midcap";
+  const minMcap        = isMidcap ? (s.midcapMinMcap ?? s.minMcap)            : s.minMcap;
+  const maxMcap        = isMidcap ? (s.midcapMaxMcap ?? s.maxMcap)            : s.maxMcap;
+  const minHolders     = isMidcap ? (s.midcapMinHolders ?? s.minHolders)      : s.minHolders;
+  const minTvl         = isMidcap ? (s.midcapMinTvl ?? s.minTvl)              : s.minTvl;
+  const maxTvl         = isMidcap ? (s.midcapMaxTvl ?? s.maxTvl)              : s.maxTvl;
+  const minBinStep     = isMidcap ? (s.midcapMinBinStep ?? s.minBinStep)      : s.minBinStep;
+  const maxBinStep     = isMidcap ? (s.midcapMaxBinStep ?? s.maxBinStep)      : s.maxBinStep;
+  const minOrganic     = isMidcap ? (s.midcapMinOrganic ?? s.minOrganic)      : s.minOrganic;
+  const minQuoteOrganic = isMidcap ? (s.midcapMinOrganic ?? s.minQuoteOrganic): s.minQuoteOrganic;
+  const maxTokenAgeHours = isMidcap ? (s.midcapMaxTokenAgeHours ?? s.maxTokenAgeHours) : s.maxTokenAgeHours;
+  // API ratio floor: midcap uses a loose dust-floor so the absolute-fee OR gate
+  // (which runs post-fetch) gets a chance to admit fat-fee large pools.
+  const apiFeeRatioFloor = isMidcap
+    ? Math.min(s.midcapMinFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, 0.001)
+    : s.minFeeActiveTvlRatio;
+
+  return [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
     s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
-    `base_token_market_cap>=${s.minMcap}`,
-    `base_token_market_cap<=${s.maxMcap}`,
-    `base_token_holders>=${s.minHolders}`,
+    `base_token_market_cap>=${minMcap}`,
+    `base_token_market_cap<=${maxMcap}`,
+    `base_token_holders>=${minHolders}`,
     `volume>=${s.minVolume}`,
-    `tvl>=${s.minTvl}`,
-    s.maxTvl != null ? `tvl<=${s.maxTvl}` : null,
-    `dlmm_bin_step>=${s.minBinStep}`,
-    `dlmm_bin_step<=${s.maxBinStep}`,
-    `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
-    `base_token_organic_score>=${s.minOrganic}`,
-    `quote_token_organic_score>=${s.minQuoteOrganic}`,
+    `tvl>=${minTvl}`,
+    maxTvl != null ? `tvl<=${maxTvl}` : null,
+    `dlmm_bin_step>=${minBinStep}`,
+    `dlmm_bin_step<=${maxBinStep}`,
+    `fee_active_tvl_ratio>=${apiFeeRatioFloor}`,
+    `base_token_organic_score>=${minOrganic}`,
+    `quote_token_organic_score>=${minQuoteOrganic}`,
     s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
-    s.maxTokenAgeHours != null ? `base_token_created_at>=${Date.now() - s.maxTokenAgeHours * 3_600_000}` : null,
+    maxTokenAgeHours != null ? `base_token_created_at>=${Date.now() - maxTokenAgeHours * 3_600_000}` : null,
     Array.isArray(s.allowedLaunchpads) && s.allowedLaunchpads.length > 0
       ? `base_token_launchpad=[${s.allowedLaunchpads.join(",")}]`
       : null,
   ].filter(Boolean).join("&&");
+}
 
+/**
+ * Fetch + volatility-normalize + threshold-filter pools for a single tier.
+ * Returns { rawPools, filteredExamples, total } — rawPools are uncondensed.
+ * Discord signals are merged only into the degen tier (they're degen-oriented).
+ */
+async function fetchTierPools(s, tier, page_size, { timeframe, category } = {}) {
+  const tf = timeframe || s.timeframe;
+  const cat = category || s.category;
+  const filters = buildDiscoveryFilters(s, tier);
   const data = await fetchPoolDiscoveryPage({
     page_size,
     filters,
-    timeframe: s.timeframe,
-    category: s.category,
+    timeframe: tf,
+    category: cat,
   });
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
 
-  if (config.screening.useDiscordSignals) {
+  // Discord signals only merge into the degen tier.
+  if (tier === "degen" && config.screening.useDiscordSignals) {
     const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {
       log("screening", `Discord signal fetch failed: ${error.message}`);
       return [];
@@ -489,8 +607,7 @@ export async function discoverPools({
 
     if (config.screening.discordSignalMode === "only") {
       rawPools = signalPools;
-      // Refresh all signal pools with live data since discovery_pool is a stale snapshot
-      await refreshDiscordOnlyPools(rawPools, s.timeframe);
+      await refreshDiscordOnlyPools(rawPools, tf);
     } else if (signalPools.length > 0) {
       const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
       const discordOnlyPools = [];
@@ -510,27 +627,71 @@ export async function discoverPools({
         }
       }
       rawPools = Array.from(byPool.values());
-      // Refresh discord-only pools with live data — their discovery_pool is a stale snapshot
-      // so volume/volatility/fee may be 0 even when the pool is active right now
       if (discordOnlyPools.length > 0) {
-        await refreshDiscordOnlyPools(discordOnlyPools, s.timeframe);
+        await refreshDiscordOnlyPools(discordOnlyPools, tf);
       }
     }
   }
 
-  rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
-  await enrichDiscordSignalLaunchpads(rawPools);
+  rawPools = await applyVolatilityTimeframe(rawPools, tf);
+  if (tier === "degen") await enrichDiscordSignalLaunchpads(rawPools);
+  await enrichFee24hForPools(rawPools, s, tier);
 
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
-    const reason = getRawPoolScreeningRejectReason(pool, s);
+    const reason = getRawPoolScreeningRejectReason(pool, s, tier);
     if (!reason) return true;
     filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason });
     if (pool.discord_signal) log("screening", `Discord signal filtered: ${pool.name || pool.pool_address} — ${reason}`);
     return false;
   });
 
-  const condensed = thresholdedRawPools.map(condensePool);
+  // Tag each surviving pool with the tier that admitted it.
+  for (const pool of thresholdedRawPools) pool._tier = tier;
+
+  return { rawPools: thresholdedRawPools, filteredExamples, total: data.total };
+}
+
+/**
+ * Fetch pools from the Meteora Pool Discovery API.
+ * Runs the degen tier always; if midcapEnabled, also runs the midcap tier and
+ * merges by pool_address (degen tag wins on overlap). Returns condensed pools.
+ */
+export async function discoverPools({
+  page_size = 50,
+  timeframe,
+  category,
+} = {}) {
+  const s = config.screening;
+
+  const tiers = ["degen"];
+  if (s.midcapEnabled) tiers.push("midcap");
+
+  const opts = { timeframe, category };
+  const tierResults = await Promise.all(
+    tiers.map((tier) => fetchTierPools(s, tier, page_size, opts).catch((error) => {
+      log("screening", `${tier} tier discovery failed: ${error.message}`);
+      return { rawPools: [], filteredExamples: [], total: 0 };
+    }))
+  );
+
+  // Merge by pool_address. Degen wins on overlap (its filters are stricter, so a
+  // pool that passes degen is the higher-conviction framing). Midcap-only pools
+  // carry the midcap tag through to the candidate block.
+  const byPool = new Map();
+  const filteredExamples = [];
+  let total = 0;
+  for (let i = 0; i < tiers.length; i++) {
+    const { rawPools, filteredExamples: tierEx, total: tierTotal } = tierResults[i];
+    if (tierTotal > total) total = tierTotal;
+    for (const ex of tierEx) filteredExamples.push(ex);
+    for (const pool of rawPools) {
+      if (!byPool.has(pool.pool_address)) byPool.set(pool.pool_address, pool);
+    }
+  }
+  let rawPools = Array.from(byPool.values());
+
+  const condensed = rawPools.map(condensePool);
 
   // Hard-filter blacklisted tokens and blocked deployers (what pool discovery already gave us)
   let pools = condensed.filter((p) => {
@@ -582,7 +743,7 @@ export async function discoverPools({
   }
 
   return {
-    total: data.total,
+    total,
     pools,
     filtered_examples: filteredExamples,
   };
@@ -603,24 +764,31 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const { positions } = await getMyPositions();
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
-  const minTvl = Number(config.screening.minTvl ?? 0);
-  const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
-  const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
+  const s = config.screening;
 
   const eligible = pools
     .filter((p) => {
+      const tier = p.tier || "degen";
+      const isMidcap = tier === "midcap";
+      const tierMinTvl = isMidcap ? (s.midcapMinTvl ?? s.minTvl) : s.minTvl;
+      const tierMaxTvl = isMidcap ? (s.midcapMaxTvl ?? s.maxTvl) : s.maxTvl;
+      const tierFeeGateOpts = isMidcap
+        ? { minFeeActiveTvlRatio: s.midcapMinFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, minFee24hUsd: s.midcapMinFee24hUsd }
+        : { minFeeActiveTvlRatio: s.minFeeActiveTvlRatio };
       const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
-      if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
+      if (Number.isFinite(tierMinTvl) && tierMinTvl > 0 && tvl < tierMinTvl) {
+        pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${tierMinTvl} (${tier})`);
         return false;
       }
-      if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
+      if (Number.isFinite(tierMaxTvl) && tierMaxTvl > 0 && tvl > tierMaxTvl) {
+        pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${tierMaxTvl} (${tier})`);
         return false;
       }
-      const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
-      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
-        pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
+      if (!passesFeeGate(p, tierFeeGateOpts)) {
+        const ratio = Number.isFinite(Number(p.fee_active_tvlRatio)) ? p.fee_active_tvl_ratio : "unknown";
+        const fee24h = estimateFee24hUsd(p);
+        const floorStr = tierFeeGateOpts.minFee24hUsd != null ? ` OR fee_24h $${fee24h.toFixed(0)} < $${tierFeeGateOpts.minFee24hUsd}` : "";
+        pushFilteredReason(filteredOut, p, `fee/active-TVL ${ratio} below ${tierFeeGateOpts.minFeeActiveTvlRatio}${floorStr} (${tier})`);
         return false;
       }
       if (!isUsableVolatility(p.volatility)) {
@@ -679,8 +847,23 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   }
 
   if (config.indicators.enabled && eligible.length > 0) {
+    const bypassMidcap = config.screening.midcapBypassIndicators !== false;
     const confirmations = await Promise.all(
       eligible.map(async (pool) => {
+        // Midcap entries are fee-yield plays, not momentum trades — skip the 5m
+        // chart gate for them. Degen still requires confirmation.
+        if (bypassMidcap && pool.tier === "midcap") {
+          return {
+            pool: pool.pool,
+            confirmation: {
+              enabled: true,
+              confirmed: true,
+              skipped: true,
+              reason: "midcap tier bypasses indicator gate (fee-yield, not momentum)",
+              intervals: [],
+            },
+          };
+        }
         try {
           const confirmation = await confirmIndicatorPreset({
             mint: pool.base?.mint,
@@ -747,6 +930,7 @@ function condensePool(p) {
   return {
     pool: p.pool_address,
     name: p.name,
+    tier: p._tier || "degen", // which screening tier admitted this pool
     base: {
       symbol: p.token_x?.symbol,
       mint: p.token_x?.address,
@@ -765,6 +949,7 @@ function condensePool(p) {
     tvl: round(p.tvl),
     active_tvl: round(p.active_tvl),
     fee_window: round(p.fee),
+    fee_24h: round(p.fee_24h) ?? null, // real 24h fee (midcap only, from enrichFee24hForPools)
     volume_window: round(p.volume),
     fee_active_tvl_ratio: p.fee_active_tvl_ratio != null ? fix(p.fee_active_tvl_ratio, 4) : null,
     volatility: fix(p.volatility, 4),
