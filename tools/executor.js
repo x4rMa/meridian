@@ -182,6 +182,53 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  // ── DAMM v2 deploy gate (Phase 2: actor) ────────────────────────────────────
+  // Phase 1 blocked every damm_v2 deploy. Phase 2 replaces that with a config-
+  // gated path: management.enableDammDeploy (default false) must be true, AND the
+  // pool's fixed sqrtMin/sqrtMax range must bracket the current price within the
+  // agent's stated downside_pct/upside_pct intent. The gate runs BEFORE any
+  // TVL/fee/volatility/bin_step check so a rejection is loud, immediate, and
+  // never reaches tx building or further RPC. Uses detail.pool_type + the REST
+  // pool_price/min_price/max_price fields only — no DAMM-program-id import.
+  if (detail.pool_type === "damm_v2") {
+    if (!config.management.enableDammDeploy) {
+      const reason = `DAMM v2 deploy is disabled (management.enableDammDeploy=false). Set the flag to opt in after verifying close/claim on a test DAMM position. (pool: ${args.pool_address?.slice?.(0, 8) ?? "?"})`;
+      console.error(`[SAFETY_BLOCK] deploy_position rejected: ${reason}`);
+      log("safety_block", `deploy_position rejected: ${reason}`);
+      return { pass: false, reason };
+    }
+    // Range verification: re-read live pool_price/min_price/max_price and confirm
+    // the fixed range brackets the current price within the requested downside/
+    // upside intent. Catches screener drift / stale pool data. Falls back to the
+    // configured dammMinDownsidePct/dammMinUpsidePct floors when the LLM didn't
+    // pass explicit downside_pct/upside_pct.
+    const price = numberOrNull(detail.pool_price);
+    const minPrice = numberOrNull(detail.min_price);
+    const maxPrice = numberOrNull(detail.max_price);
+    if (price == null || minPrice == null || maxPrice == null || price <= 0) {
+      const reason = `Live DAMM pool range unverifiable (pool_price=${price}, min_price=${minPrice}, max_price=${maxPrice}). Refusing deploy.`;
+      console.error(`[SAFETY_BLOCK] deploy_position rejected: ${reason}`);
+      log("safety_block", `deploy_position rejected: ${reason}`);
+      return { pass: false, reason };
+    }
+    const downsideGap = ((price - minPrice) / price) * 100;
+    const upsideGap = ((maxPrice - price) / price) * 100;
+    const reqDownside = numberOrNull(args.downside_pct) ?? numberOrNull(config.screening.dammMinDownsidePct);
+    const reqUpside = numberOrNull(args.upside_pct) ?? numberOrNull(config.screening.dammMinUpsidePct);
+    if (
+      (reqDownside != null && downsideGap < reqDownside) ||
+      (reqUpside != null && upsideGap < reqUpside)
+    ) {
+      const reason = `Live pool range violates requested downside/upside bounds (downside_gap ${downsideGap.toFixed(2)}%, upside_gap ${upsideGap.toFixed(2)}% vs requested ${reqDownside ?? "—"}% / ${reqUpside ?? "—"}%). (pool: ${args.pool_address?.slice?.(0, 8) ?? "?"})`;
+      console.error(`[SAFETY_BLOCK] deploy_position rejected: ${reason}`);
+      log("safety_block", `deploy_position rejected: ${reason}`);
+      return { pass: false, reason };
+    }
+    // DAMM passed the gate. Skip the DLMM-only bin_step block below (it's already
+    // null-guarded, but be explicit) and proceed to the shared TVL/fee/volatility
+    // checks, which apply to DAMM pools too.
+  }
+
   const tvl = poolDetailTvl(detail);
   const tvlBounds = tvlBoundsForTier(args.tier);
   if (tvl == null) {
@@ -473,6 +520,9 @@ const toolMap = {
       midcapMinTvl: ["screening", "midcapMinTvl"],
       midcapBypassIndicators: ["screening", "midcapBypassIndicators"],
       midcapBypassTimingFilters: ["screening", "midcapBypassTimingFilters"],
+      dammMinDownsidePct: ["screening", "dammMinDownsidePct"],
+      dammMinUpsidePct: ["screening", "dammMinUpsidePct"],
+      enableDammDeploy: ["management", "enableDammDeploy"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
       // management
@@ -835,15 +885,6 @@ async function runSafetyChecks(name, args) {
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
 
-      // Reject pools with bin_step out of the tier-specific configured range
-      const bounds = binStepBoundsForTier(args.tier);
-      if (args.bin_step != null && (args.bin_step < bounds.min || args.bin_step > bounds.max)) {
-        return {
-          pass: false,
-          reason: `bin_step ${args.bin_step} is outside the allowed range of [${bounds.min}-${bounds.max}] (tier: ${args.tier || "degen"}).`,
-        };
-      }
-
       const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
       const deployAmountX = Number(args.amount_x ?? 0);
       if (Number.isFinite(deployAmountX) && deployAmountX > 0) {
@@ -852,11 +893,6 @@ async function runSafetyChecks(name, args) {
           reason: "This agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
         };
       }
-      const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
-      const requestedBinsAbove = Number(args.bins_above ?? 0);
-      const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
-      const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
-      const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
       const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
       if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
         return {
@@ -864,43 +900,64 @@ async function runSafetyChecks(name, args) {
           reason: `volatility ${args.volatility} is invalid. Refusing deploy because the volatility feed is unusable.`,
         };
       }
-      if (
-        args.downside_pct == null &&
-        args.upside_pct == null &&
-        (
-          !Number.isFinite(requestedBinsBelow) ||
-          !Number.isFinite(requestedBinsAbove) ||
-          !Number.isInteger(requestedBinsBelow) ||
-          !Number.isInteger(requestedBinsAbove) ||
-          requestedBinsBelow < 0 ||
-          requestedBinsAbove < 0 ||
-          requestedTotalBins < minBinsBelow
-        )
-      ) {
-        return {
-          pass: false,
-          reason: `deploy range ${requestedTotalBins} total bins is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
-        };
-      }
-      if (
-        isSingleSidedSol &&
-        args.downside_pct == null &&
-        (!Number.isFinite(requestedBinsBelow) || !Number.isInteger(requestedBinsBelow) || requestedBinsBelow < minBinsBelow)
-      ) {
-        return {
-          pass: false,
-          reason: `bins_below ${args.bins_below ?? "missing"} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
-        };
-      }
-      if (
-        isSingleSidedSol &&
-        args.upside_pct == null &&
-        (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove !== 0)
-      ) {
-        return {
-          pass: false,
-          reason: "Single-side SOL deploy must use bins_above=0.",
-        };
+
+      // ── DLMM-only bin checks ────────────────────────────────────────
+      // DAMM v2 positions inherit the pool's fixed range (no bins); bins_below/
+      // bins_above/bin_step/single-sided-SOL-bins checks are DLMM-only. The DAMM
+      // range gate already ran inside validateDeployPoolThresholds above.
+      const isDamm = (args.pool_type || "dlmm") === "damm_v2";
+      if (!isDamm) {
+        // Reject pools with bin_step out of the tier-specific configured range
+        const bounds = binStepBoundsForTier(args.tier);
+        if (args.bin_step != null && (args.bin_step < bounds.min || args.bin_step > bounds.max)) {
+          return {
+            pass: false,
+            reason: `bin_step ${args.bin_step} is outside the allowed range of [${bounds.min}-${bounds.max}] (tier: ${args.tier || "degen"}).`,
+          };
+        }
+        const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
+        const requestedBinsAbove = Number(args.bins_above ?? 0);
+        const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+        const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
+        const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
+        if (
+          args.downside_pct == null &&
+          args.upside_pct == null &&
+          (
+            !Number.isFinite(requestedBinsBelow) ||
+            !Number.isFinite(requestedBinsAbove) ||
+            !Number.isInteger(requestedBinsBelow) ||
+            !Number.isInteger(requestedBinsAbove) ||
+            requestedBinsBelow < 0 ||
+            requestedBinsAbove < 0 ||
+            requestedTotalBins < minBinsBelow
+          )
+        ) {
+          return {
+            pass: false,
+            reason: `deploy range ${requestedTotalBins} total bins is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+          };
+        }
+        if (
+          isSingleSidedSol &&
+          args.downside_pct == null &&
+          (!Number.isFinite(requestedBinsBelow) || !Number.isInteger(requestedBinsBelow) || requestedBinsBelow < minBinsBelow)
+        ) {
+          return {
+            pass: false,
+            reason: `bins_below ${args.bins_below ?? "missing"} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+          };
+        }
+        if (
+          isSingleSidedSol &&
+          args.upside_pct == null &&
+          (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove !== 0)
+        ) {
+          return {
+            pass: false,
+            reason: "Single-side SOL deploy must use bins_above=0.",
+          };
+        }
       }
 
       // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache

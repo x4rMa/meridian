@@ -31,6 +31,8 @@
   "maxMcap": 10000000,
   "minBinStep": 80,
   "maxBinStep": 125,
+  "dammMinDownsidePct": 15,
+  "dammMinUpsidePct": 15,
   "minFeeActiveTvlRatio": 0.05,
   "minTokenFeesSol": 30,
   "useDiscordSignals": false,
@@ -60,6 +62,7 @@
   "trailingDropPct": 1.5,
   "pnlSanityMaxDiffPct": 5,
   "solMode": false,
+  "enableDammDeploy": false,
 
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,

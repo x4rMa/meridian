@@ -127,6 +127,15 @@ export const config = {
     // Same logic for the ATH-proximity (minDrawdownFromAthPct) and volume-acceleration
     // (requireVolumeAccelerating) gates — both are momentum-timing signals. Bypassed for midcap.
     midcapBypassTimingFilters: u.midcapBypassTimingFilters ?? true,
+
+    // ─── DAMM v2 ─────────────────────────────────────────────────
+    // DAMM positions inherit the pool's FIXED sqrtMin/sqrtMax range — you cannot
+    // set a per-position range like DLMM's bins_below/bins_above. downside_pct /
+    // upside_pct become POOL-SELECTION bounds: only deploy into a DAMM pool whose
+    // fixed range brackets the current price within these floors. The screener
+    // and the executor safety rail both enforce them.
+    dammMinDownsidePct: u.dammMinDownsidePct ?? 15, // min (current-min)/current coverage
+    dammMinUpsidePct:   u.dammMinUpsidePct   ?? 15, // min (max-current)/current coverage
   },
 
   // ─── Position Management ────────────────
@@ -160,6 +169,10 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // DAMM v2 deploy gate. Phase 2 ships deploy code but defaults this to false —
+    // the operator flips it to true after verifying close/claim on a test DAMM
+    // position. While false, the safety rail blocks every damm_v2 deploy loudly.
+    enableDammDeploy:      u.enableDammDeploy      ?? false,
   },
 
   // ─── Strategy Mapping ───────────────────

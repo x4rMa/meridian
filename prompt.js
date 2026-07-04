@@ -125,6 +125,13 @@ DEPLOY RULES:
 - Bin steps must be [80-125] for degen candidates, [40-150] for midcap candidates. Always pass the candidate's tier through to deploy_position so the safety check applies the correct range.
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
 
+DAMM v2 DEPLOY RULES (when candidate pool_type === 'damm_v2'):
+- There are NO bins. The position inherits the pool's fixed min_price/max_price range. Do not pass bins_below/bins_above.
+- Pass pool_type: "damm_v2" through to deploy_position.
+- downside_pct / upside_pct become POOL-SELECTION bounds, not a per-position range. The screener has already filtered out pools whose fixed range violates your intent, and the safety rail re-checks against live pool data. Pass the same downside_pct/upside_pct you used for selection.
+- Use amount_y only (single-side SOL). amount_x must be 0.
+- pnl_pct is NOT available for DAMM in this phase; the manager will hold/close based on OOR and instructions, not PnL rules.
+
 ${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;
   } else if (agentType === "MANAGER") {

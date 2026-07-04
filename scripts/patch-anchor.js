@@ -1,12 +1,13 @@
 /**
- * Patches @coral-xyz/anchor + @meteora-ag/dlmm for Node 24 ESM compatibility.
+ * Patches @coral-xyz/anchor + @meteora-ag/{dlmm,cp-amm-sdk} for Node 24 ESM.
  *
  * Problem: Node 24 ESM doesn't support bare directory imports (e.g. "utils/bytes").
- * DLMM's index.mjs does: import { bs58 } from "@coral-xyz/anchor/dist/cjs/utils/bytes"
+ * Meteora's index.mjs files do: import { bs58 } from "@coral-xyz/anchor/dist/cjs/utils/bytes"
  * ESM never extension-guesses, so it hits the bytes/ directory and throws.
  *
  * Fix 1: Add an exports map to anchor's package.json mapping each util dir to its index.js.
- * Fix 2: Directly rewrite the bare import in DLMM's index.mjs to use the explicit path.
+ * Fix 2: Rewrite the bare import in each Meteora SDK's index.mjs to use the explicit path,
+ *        and dedupe/alias BN imports (anchor's CJS BN export is unreachable from ESM).
  */
 
 import fs from "fs";
@@ -48,11 +49,24 @@ if (!anchorPkg.exports) {
   console.log("Skip: @coral-xyz/anchor exports already set");
 }
 
-// ─── Fix 2: Patch DLMM index.mjs bare directory imports ──────────────────────
-const dlmmMjs = path.join(root, "node_modules/@meteora-ag/dlmm/dist/index.mjs");
+// ─── Fix 2: Patch a Meteora SDK's index.mjs bare directory imports + BN ──────
+// Applies to both @meteora-ag/dlmm and @meteora-ag/cp-amm-sdk — they share the
+// same anchor-import patterns. Each SDK gets its own pass; a missing SDK (e.g.
+// during a partial install) is skipped via fs.existsSync rather than crashing.
+function removeBNFromSpecifiers(specifiers) {
+  return specifiers
+    .split(",")
+    .map(s => s.trim())
+    .filter(s => s && !/^BN(\s+as\s+\w+)?$/.test(s))
+    .join(", ");
+}
 
-if (fs.existsSync(dlmmMjs)) {
-  let src = fs.readFileSync(dlmmMjs, "utf8");
+function patchMeteoraSdk(label, mjsPath) {
+  if (!fs.existsSync(mjsPath)) {
+    console.log(`Skip: ${label} not present at ${path.relative(root, mjsPath)}`);
+    return;
+  }
+  let src = fs.readFileSync(mjsPath, "utf8");
   const original = src;
 
   // Replace all bare directory imports of anchor utils with explicit .js paths
@@ -61,24 +75,13 @@ if (fs.existsSync(dlmmMjs)) {
     (_, p) => `from "${p}/index.js"`
   );
 
-  // Fix 3: ESM cannot find named export 'BN' from CommonJS anchor
-  // We rewrite the imports to remove BN and then add a single top-level BN import.
-
-  // Strip any existing duplicate `import BN from "bn.js"` lines first
+  // ESM cannot find named export 'BN' from CommonJS anchor.
+  // Strip any existing duplicate `import BN from "bn.js"` lines first.
   src = src.replace(/^import BN from "bn\.js";\n/gm, "");
 
-  // Add exactly one BN import at the top if BN is used
+  // Add exactly one BN import at the top if BN is used alongside an anchor import.
   if (src.includes('from "@coral-xyz/anchor"') && src.includes('BN')) {
     src = 'import BN from "bn.js";\n' + src;
-  }
-
-  // Helper: remove BN or BN as alias from an import specifier list and clean up commas
-  function removeBNFromSpecifiers(specifiers) {
-    return specifiers
-      .split(",")
-      .map(s => s.trim())
-      .filter(s => s && !/^BN(\s+as\s+\w+)?$/.test(s))
-      .join(", ");
   }
 
   // Handle aliased BN imports: import { BN as BN18 } from "@coral-xyz/anchor";
@@ -101,9 +104,12 @@ if (fs.existsSync(dlmmMjs)) {
   );
 
   if (src !== original) {
-    fs.writeFileSync(dlmmMjs, src);
-    console.log("Patched: @meteora-ag/dlmm/dist/index.mjs directory imports");
+    fs.writeFileSync(mjsPath, src);
+    console.log(`Patched: ${label} directory imports + BN`);
   } else {
-    console.log("Skip: @meteora-ag/dlmm/dist/index.mjs already patched");
+    console.log(`Skip: ${label} already patched`);
   }
 }
+
+patchMeteoraSdk("@meteora-ag/dlmm", path.join(root, "node_modules/@meteora-ag/dlmm/dist/index.mjs"));
+patchMeteoraSdk("@meteora-ag/cp-amm-sdk", path.join(root, "node_modules/@meteora-ag/cp-amm-sdk/dist/index.mjs"));

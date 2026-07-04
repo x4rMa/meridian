@@ -203,7 +203,7 @@ function getVolatilityTimeframe(sourceTimeframe) {
   return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
 }
 
-function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
+export function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};
   const binStep = numeric(pool?.dlmm_params?.bin_step);
@@ -241,7 +241,7 @@ function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   if (pool?.base_token_has_critical_warnings === true) return "base token has critical warnings";
   if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
-  if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
+  if (pool?.pool_type && !["dlmm", "damm_v2"].includes(pool.pool_type)) return `pool_type ${pool.pool_type} is not dlmm/damm_v2`;
 
   if (mcap == null || mcap < minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${minMcap}`;
   if (mcap > maxMcap) return `mcap ${mcap} above maxMcap ${maxMcap}`;
@@ -249,8 +249,36 @@ function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
   if (tvl == null || tvl < minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${minTvl}`;
   if (maxTvl != null && tvl > maxTvl) return `TVL ${tvl} above maxTvl ${maxTvl}`;
-  if (binStep == null || binStep < minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${minBinStep}`;
-  if (binStep > maxBinStep) return `bin_step ${binStep} above maxBinStep ${maxBinStep}`;
+
+  // ── Bin-step check: DLMM only. DAMM v2 pools have no bin_step ────────────────
+  // (the position inherits the pool's fixed sqrtMin/sqrtMax range instead).
+  if (pool?.pool_type !== "damm_v2") {
+    if (binStep == null || binStep < minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${minBinStep}`;
+    if (binStep > maxBinStep) return `bin_step ${binStep} above maxBinStep ${maxBinStep}`;
+  } else {
+    // ── DAMM v2 range gate: pool's fixed range must bracket current price ────
+    // downside_gap = (pool_price - min_price) / pool_price
+    // upside_gap   = (max_price - pool_price) / pool_price
+    // Both must meet the configured floors (dammMinDownsidePct / dammMinUpsidePct).
+    // The pool-discovery REST API returns pool_price/min_price/max_price for DAMM.
+    const pp = numeric(pool?.pool_price);
+    const pmin = numeric(pool?.min_price);
+    const pmax = numeric(pool?.max_price);
+    if (pp == null || pmin == null || pmax == null || pp <= 0) {
+      return `DAMM v2 pool missing pool_price/min_price/max_price for range check`;
+    }
+    const downsideGap = ((pp - pmin) / pp) * 100;
+    const upsideGap = ((pmax - pp) / pp) * 100;
+    const reqDownside = numeric(s.dammMinDownsidePct);
+    const reqUpside = numeric(s.dammMinUpsidePct);
+    if (reqDownside != null && downsideGap < reqDownside) {
+      return `Pool fixed range exceeds downside/upside risk bounds for DAMM v2 (downside_gap ${downsideGap.toFixed(2)}% < ${reqDownside}%)`;
+    }
+    if (reqUpside != null && upsideGap < reqUpside) {
+      return `Pool fixed range exceeds downside/upside risk bounds for DAMM v2 (upside_gap ${upsideGap.toFixed(2)}% < ${reqUpside}%)`;
+    }
+  }
+
   if (!passesFeeGate(pool, feeGateOpts)) {
     const fee24h = estimateFee24hUsd(pool);
     const floorStr = feeGateOpts.minFee24hUsd != null ? ` OR fee_24h $${fee24h.toFixed(0)} < $${feeGateOpts.minFee24hUsd}` : "";
@@ -546,15 +574,16 @@ function buildDiscoveryFilters(s, tier) {
     "quote_token_has_critical_warnings=false",
     s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
     "base_token_has_high_single_ownership=false",
-    "pool_type=dlmm",
+    "pool_type=dlmm,damm_v2",
     `base_token_market_cap>=${minMcap}`,
     `base_token_market_cap<=${maxMcap}`,
     `base_token_holders>=${minHolders}`,
     `volume>=${s.minVolume}`,
     `tvl>=${minTvl}`,
     maxTvl != null ? `tvl<=${maxTvl}` : null,
-    `dlmm_bin_step>=${minBinStep}`,
-    `dlmm_bin_step<=${maxBinStep}`,
+    // dlmm_bin_step API filter dropped: it excludes DAMM v2 pools (no bin_step).
+    // bin_step bounds are enforced in-code in getRawPoolScreeningRejectReason,
+    // which is DLMM-only — DAMM pools hit the range gate there instead.
     `fee_active_tvl_ratio>=${apiFeeRatioFloor}`,
     `base_token_organic_score>=${minOrganic}`,
     `quote_token_organic_score>=${minQuoteOrganic}`,
@@ -944,6 +973,14 @@ function condensePool(p) {
     pool_type: p.pool_type,
     bin_step: p.dlmm_params?.bin_step || null,
     fee_pct: p.fee_pct,
+    // DAMM v2 only: the pool's fixed price range (DAMM positions inherit it,
+    // no per-position range). null for DLMM. Surfaces the range to the LLM so
+    // it can pass downside_pct/upside_pct that fit within this envelope.
+    price_range: p.pool_type === "damm_v2" ? {
+      current: p.pool_price ?? null,
+      min: p.min_price ?? null,
+      max: p.max_price ?? null,
+    } : null,
 
     // Core metrics (the numbers that matter)
     tvl: round(p.tvl),

@@ -30,6 +30,7 @@ import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { getCpAmmPositions, deployDammPosition, closeDammPosition, claimDammFees } from "./damm.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -472,8 +473,20 @@ export async function deployPosition({
   entry_tvl,
   entry_volume,
   entry_holders,
+  pool_type = "dlmm",
 }) {
   pool_address = normalizeMint(pool_address);
+  // ── Dispatch: DAMM v2 pools route to the cp-amm SDK (no bins, fixed pool range).
+  // The executor's safety gate has already verified enableDammDeploy + the live
+  // range by the time we get here, so the DAMM wrapper can focus on tx building.
+  if (pool_type === "damm_v2") {
+    return deployDammPosition({
+      pool_address, amount_sol, amount_x, amount_y,
+      downside_pct, upside_pct, pool_name,
+      volatility, fee_tvl_ratio, organic_score, initial_value_usd,
+      entry_mcap, entry_tvl, entry_volume, entry_holders,
+    });
+  }
   const activeStrategy = strategy || config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
@@ -1136,6 +1149,30 @@ async function fetchRawOpenPositionsFromMeridian({ walletAddress, agentId }) {
   };
 }
 
+// ─── DAMM merge helper (Phase 1 read-only) ────────────────────────────────────
+// Wraps the DAMM fetch in the critical try/catch (guardrail #1): if the DAMM
+// SDK/RPC throws for any reason, log a warning and return [] so the DLMM result
+// is unaffected. The DLMM and DAMM fetches are independent — a DAMM outage must
+// never crash or block the manager cycle / DLMM poller.
+async function fetchDammPositionsGuarded(walletAddress, solMode) {
+  try {
+    return await getCpAmmPositions({ wallet_address: walletAddress, solMode });
+  } catch (error) {
+    log("damm_warn", `DAMM position fetch failed (degrading to no DAMM positions): ${error.message}`);
+    return [];
+  }
+}
+
+// Tag each DLMM position with pool_type:'dlmm' (default for backward compat —
+// only set if absent, so existing code that doesn't read pool_type is unaffected
+// and downstream consumers see a uniform shape).
+function tagDlmmPositions(positions) {
+  for (const p of positions) {
+    if (!p.pool_type) p.pool_type = "dlmm";
+  }
+  return positions;
+}
+
 // ─── Get My Positions ──────────────────────────────────────────
 export async function getMyPositions({ force = false, silent = false, wallet_address = null } = {}) {
   let walletOverride = null;
@@ -1166,6 +1203,16 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       try {
         if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
         const rpcResult = await computePositions(walletAddress);
+        // Phase 1 DAMM merge: fetch DAMM positions independently and append.
+        // A DAMM failure (fetchDammPositionsGuarded → []) never affects the
+        // DLMM result. DLMM positions are tagged pool_type:'dlmm' for the
+        // uniform shape; DAMM positions carry pool_type:'damm_v2' from damm.js.
+        tagDlmmPositions(rpcResult.positions);
+        const dammPositions = await fetchDammPositionsGuarded(walletAddress, config.management.solMode);
+        if (dammPositions.length) {
+          rpcResult.positions = [...rpcResult.positions, ...dammPositions];
+          rpcResult.total_positions = rpcResult.positions.length;
+        }
         if (useLocalWallet) {
           syncOpenPositions(rpcResult.positions.map((p) => p.position));
           _positionsCache = rpcResult;
@@ -1337,8 +1384,15 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       positions,
       source: "meteora",
     };
+    // Phase 1 DAMM merge (same pattern as the RPC path above).
+    tagDlmmPositions(result.positions);
+    const dammPositions = await fetchDammPositionsGuarded(walletAddress, config.management.solMode);
+    if (dammPositions.length) {
+      result.positions = [...result.positions, ...dammPositions];
+      result.total_positions = result.positions.length;
+    }
     if (useLocalWallet) {
-      syncOpenPositions(positions.map(p => p.position));
+      syncOpenPositions(result.positions.map(p => p.position));
       _positionsCache = result;
       _positionsCacheAt = Date.now();
     }
@@ -1368,7 +1422,14 @@ export async function getWalletPositions({ wallet_address }) {
       filters: [{ memcmp: { offset: 40, bytes: new PublicKey(wallet_address).toBase58() } }],
     });
 
-    if (accounts.length === 0) {
+    // Phase 1 Gap #1 fix: also fetch DAMM v2 positions for this wallet.
+    // getCpAmmPositions does its own getProgramAccounts via the cp-amm SDK
+    // (program ID cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG) and returns the
+    // unified shape with pool_type:'damm_v2'. Wrapped in try/catch so a DAMM
+    // outage never blocks the DLMM fetch — the two are independent.
+    const dammPositions = await fetchDammPositionsGuarded(wallet_address, config.management.solMode);
+
+    if (accounts.length === 0 && dammPositions.length === 0) {
       return { wallet: wallet_address, total_positions: 0, positions: [] };
     }
 
@@ -1406,6 +1467,7 @@ export async function getWalletPositions({ wallet_address }) {
       return {
         position:           r.position,
         pool:               r.pool,
+        pool_type:          "dlmm",
         lower_bin:          p?.lowerBinId      ?? null,
         upper_bin:          p?.upperBinId      ?? null,
         active_bin:         p?.poolActiveBinId ?? null,
@@ -1418,7 +1480,10 @@ export async function getWalletPositions({ wallet_address }) {
       };
     });
 
-    return { wallet: wallet_address, total_positions: positions.length, positions };
+    // Merge DAMM positions (already carry pool_type:'damm_v2' + full shape).
+    const allPositions = [...positions, ...dammPositions];
+
+    return { wallet: wallet_address, total_positions: allPositions.length, positions: allPositions };
   } catch (error) {
     log("wallet_positions_error", error.message);
     return { wallet: wallet_address, total_positions: 0, positions: [], error: error.message };
@@ -1451,6 +1516,13 @@ export async function searchPools({ query, limit = 10 }) {
 // ─── Claim Fees ────────────────────────────────────────────────
 export async function claimFees({ position_address }) {
   position_address = normalizeMint(position_address);
+  // ── Dispatch: DAMM v2 positions route to the cp-amm SDK claim path. Checked
+  // before the DRY_RUN / closed gates so a DAMM position hits the DAMM path
+  // (which owns its own DRY_RUN short-circuit), not the DLMM one.
+  const trackedPre = getTrackedPosition(position_address);
+  if (trackedPre?.pool_type === "damm_v2") {
+    return claimDammFees({ position_address });
+  }
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
@@ -1497,6 +1569,13 @@ export async function claimFees({ position_address }) {
 // ─── Close Position ────────────────────────────────────────────
 export async function closePosition({ position_address, reason }) {
   position_address = normalizeMint(position_address);
+  // ── Dispatch: DAMM v2 positions route to the cp-amm SDK close path. Checked
+  // before the DRY_RUN gate so a DAMM position hits the DAMM dry-run path (which
+  // owns its own DRY_RUN short-circuit), not the DLMM one.
+  const trackedPre = getTrackedPosition(position_address);
+  if (trackedPre?.pool_type === "damm_v2") {
+    return closeDammPosition({ position_address, reason });
+  }
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }

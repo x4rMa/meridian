@@ -33,7 +33,19 @@ function load() {
     return { positions: {}, recentEvents: [], lastUpdated: null };
   }
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    // Backward-compat migration: existing state.json positions predate the
+    // pool_type field (DLMM-only era). Patch every loaded position to 'dlmm'
+    // if the field is absent, so the manager cycle and reports always see a
+    // populated pool_type. This runs in-memory on every load — never throws,
+    // never mutates disk (a subsequent save() will persist it, which is fine).
+    if (state && state.positions) {
+      for (const posId in state.positions) {
+        const pos = state.positions[posId];
+        if (pos && !pos.pool_type) pos.pool_type = "dlmm";
+      }
+    }
+    return state;
   } catch (err) {
     log("state_error", `Failed to read state.json: ${err.message}`);
     return { positions: {}, lastUpdated: null };
@@ -73,6 +85,7 @@ export function trackPosition({
   entry_tvl = null,
   entry_volume = null,
   entry_holders = null,
+  pool_type = "dlmm",
 }) {
   const state = load();
   state.positions[position] = {
@@ -95,6 +108,7 @@ export function trackPosition({
     entry_volume,
     entry_holders,
     signal_snapshot: signal_snapshot || null,
+    pool_type,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
     last_claim_at: null,
@@ -114,7 +128,7 @@ export function trackPosition({
   };
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
   save(state);
-  log("state", `Tracked new position: ${position} in pool ${pool}`);
+  log("state", `Tracked new ${pool_type} position: ${position} in pool ${pool}`);
 }
 
 /**
@@ -334,6 +348,7 @@ export function getStateSummary() {
     positions: open.map((p) => ({
       position: p.position,
       pool: p.pool,
+      pool_type: p.pool_type || "dlmm",
       strategy: p.strategy,
       deployed_at: p.deployed_at,
       out_of_range_since: p.out_of_range_since,
