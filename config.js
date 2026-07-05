@@ -89,6 +89,17 @@ export const config = {
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     useDiscordSignals: u.useDiscordSignals ?? false,
     discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
+    // ─── GMGN trending candidate source ───────────────────────────
+    // Mirrors useDiscordSignals/discordSignalMode. When useGmgnTrending is true,
+    // the screener fetches 1h-trending SOL tokens from GMGN's /v1/market/rank,
+    // resolves each to its highest-liquidity Meteora DLMM pool, and feeds them
+    // through the same hard-filter pipeline as Meteora-discovery pools.
+    useGmgnTrending:        u.useGmgnTrending        ?? false,
+    gmgnSignalMode:         u.gmgnSignalMode         ?? "merge", // merge | only
+    gmgnTrendingInterval:   u.gmgnTrendingInterval   ?? "1h",    // 1m|5m|1h|6h|24h
+    gmgnTrendingMinVolume:  u.gmgnTrendingMinVolume  ?? 100_000, // USD volume over the interval
+    gmgnTrendingLimit:      u.gmgnTrendingLimit      ?? 20,      // max GMGN candidates recon'd per cycle
+    gmgnTrendingOrderBy:    u.gmgnTrendingOrderBy    ?? "volume",
     avoidPvpSymbols:   u.avoidPvpSymbols   ?? true, // avoid exact-symbol rivals with real active pools
     blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
@@ -347,6 +358,12 @@ export function reloadScreeningThresholds() {
     if (fresh.maxTop10Pct      != null) s.maxTop10Pct      = fresh.maxTop10Pct;
     if (fresh.useDiscordSignals !== undefined) s.useDiscordSignals = fresh.useDiscordSignals;
     if (fresh.discordSignalMode != null) s.discordSignalMode = fresh.discordSignalMode;
+    if (fresh.useGmgnTrending       !== undefined) s.useGmgnTrending       = fresh.useGmgnTrending;
+    if (fresh.gmgnSignalMode        != null) s.gmgnSignalMode        = fresh.gmgnSignalMode;
+    if (fresh.gmgnTrendingInterval  != null) s.gmgnTrendingInterval  = fresh.gmgnTrendingInterval;
+    if (fresh.gmgnTrendingMinVolume != null) s.gmgnTrendingMinVolume = fresh.gmgnTrendingMinVolume;
+    if (fresh.gmgnTrendingLimit     != null) s.gmgnTrendingLimit     = fresh.gmgnTrendingLimit;
+    if (fresh.gmgnTrendingOrderBy   != null) s.gmgnTrendingOrderBy   = fresh.gmgnTrendingOrderBy;
     if (fresh.excludeHighSupplyConcentration !== undefined) s.excludeHighSupplyConcentration = fresh.excludeHighSupplyConcentration;
     if (fresh.minOrganic     != null) s.minOrganic     = fresh.minOrganic;
     if (fresh.minQuoteOrganic != null) s.minQuoteOrganic = fresh.minQuoteOrganic;

@@ -111,3 +111,75 @@ export async function getGmgnTokenFees(mint) {
     return null;
   }
 }
+
+// ─── Trending tokens (candidate source for screening) ──────────
+// GET /v1/market/rank — trending tokens ranked by swap activity over a window.
+// Returns mapped rank items with the fields the screener needs to resolve a
+// Meteora DLMM pool and assess risk. Keyless / error → [] (non-blocking).
+const DEFAULT_TRENDING_FILTERS_SOL = ["renounced", "frozen"];
+
+export async function getGmgnTrending({
+  chain = "sol",
+  interval = "1h",
+  minVolume = 100_000,
+  limit = 50,
+  orderBy = "volume",
+  filters,
+  platforms = [],
+} = {}) {
+  if (!hasGmgnApiKey()) {
+    log("gmgn", "trending skipped: no API key");
+    return [];
+  }
+  // SOL chains default to renounced+frozen safety filters (matching gmgn-cli's
+  // documented chain defaults). Pass an explicit [] to disable.
+  const resolvedFilters = filters === undefined && chain === "sol"
+    ? DEFAULT_TRENDING_FILTERS_SOL
+    : (filters || []);
+  try {
+    const payload = await gmgnFetch("/v1/market/rank", {
+      params: {
+        chain,
+        interval,
+        order_by: orderBy,
+        limit,
+        min_volume: minVolume,
+        filters: resolvedFilters,
+        platforms,
+      },
+    });
+    // Response envelope is { code, data: { code, data: { rank: [...] } } } —
+    // the OpenAPI wraps the upstream rank payload in a second `data` layer.
+    const rank = payload?.data?.data?.rank || payload?.data?.rank || payload?.rank || [];
+    if (!Array.isArray(rank)) return [];
+    return rank.map((item) => ({
+      mint: item.address,
+      symbol: item.symbol,
+      name: item.name,
+      chain: item.chain || chain,
+      volume: num(item.volume),
+      liquidity: num(item.liquidity),
+      market_cap: num(item.market_cap),
+      holder_count: num(item.holder_count),
+      launchpad: item.launchpad || null,
+      launchpad_platform: item.launchpad_platform || null,
+      exchange: item.exchange || null,
+      // Risk signals — layered onto the pool as gmgn_signals (do NOT bypass
+      // Meridian's on-chain gates; for the LLM to see).
+      rug_ratio: num(item.rug_ratio),
+      top_10_holder_rate: num(item.top_10_holder_rate),
+      is_wash_trading: Boolean(item.is_wash_trading),
+      smart_degen_count: num(item.smart_degen_count),
+      renowned_count: num(item.renowned_count),
+      bundler_rate: num(item.bundler_rate),
+      creator_token_status: item.creator_token_status || null,
+      creator: item.creator || null,
+      price: num(item.price),
+      price_change_percent_1h: num(item.price_change_percent1h),
+      rank: num(item.rank),
+    }));
+  } catch (error) {
+    log("gmgn", `trending fetch failed: ${error.message}`);
+    return [];
+  }
+}

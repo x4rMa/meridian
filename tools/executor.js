@@ -272,11 +272,34 @@ async function validateDeployPoolThresholds(args) {
     }
   }
 
-  const volatility = poolDetailVolatility(volatilityDetail);
+  let volatility = poolDetailVolatility(volatilityDetail);
+  let effectiveVolatilityTimeframe = volatilityTimeframe;
+  // Mirror the screener's 24h fallback (screening.js:enrichFee24hForPools). A pool
+  // that was momentarily quiet over the 30m slice still has real price variance on
+  // the 24h window — the screener stamps that onto the candidate and lets it
+  // through. Re-fetching only the 30m window at deploy time then reads 0 and
+  // blocks a candidate the screener accepted. Fall back to the 24h window before
+  // rejecting so the two gates agree.
+  if ((volatility == null || volatility <= 0) && volatilityTimeframe !== "24h") {
+    let fallbackDetail = null;
+    try {
+      fallbackDetail = await fetchFreshPoolDetail(args.pool_address, "24h");
+    } catch (error) {
+      return {
+        pass: false,
+        reason: `Could not verify pool ${volatilityTimeframe} volatility before deploy and 24h fallback failed: ${error.message}`,
+      };
+    }
+    const fallbackVolatility = poolDetailVolatility(fallbackDetail);
+    if (fallbackVolatility != null && fallbackVolatility > 0) {
+      volatility = fallbackVolatility;
+      effectiveVolatilityTimeframe = "24h";
+    }
+  }
   if (volatility == null || volatility <= 0) {
     return {
       pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
+      reason: `Pool ${effectiveVolatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
     };
   }
 
@@ -350,6 +373,7 @@ function normalizeConfigValue(key, value) {
     "midcapEnabled",
     "midcapBypassIndicators",
     "midcapBypassTimingFilters",
+    "useGmgnTrending",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
   const stringKeys = new Set([
@@ -372,6 +396,9 @@ function normalizeConfigValue(key, value) {
     "pnlRpcUrl",
     "gmgnFeeSource",
     "gmgnApiKey",
+    "gmgnSignalMode",
+    "gmgnTrendingInterval",
+    "gmgnTrendingOrderBy",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
@@ -604,6 +631,13 @@ const toolMap = {
       // gmgn fee source
       gmgnFeeSource: ["gmgn", "feeSource", ["gmgnFeeSource"]],
       gmgnApiKey: ["gmgn", "apiKey", ["gmgnApiKey"]],
+      // gmgn trending candidate source (screening knobs, flat-key persistence)
+      useGmgnTrending: ["screening", "useGmgnTrending"],
+      gmgnSignalMode: ["screening", "gmgnSignalMode", ["gmgnSignalMode"]],
+      gmgnTrendingInterval: ["screening", "gmgnTrendingInterval", ["gmgnTrendingInterval"]],
+      gmgnTrendingMinVolume: ["screening", "gmgnTrendingMinVolume"],
+      gmgnTrendingLimit: ["screening", "gmgnTrendingLimit"],
+      gmgnTrendingOrderBy: ["screening", "gmgnTrendingOrderBy", ["gmgnTrendingOrderBy"]],
       // chart indicators
       chartIndicatorsEnabled: ["indicators", "enabled", ["chartIndicators", "enabled"]],
       indicatorEntryPreset: ["indicators", "entryPreset", ["chartIndicators", "entryPreset"]],

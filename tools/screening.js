@@ -5,6 +5,8 @@ import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { getGmgnTrending } from "./gmgn.js";
+import { searchPools } from "./dlmm.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -599,6 +601,123 @@ async function refreshDiscordOnlyPools(pools, timeframe) {
   }
 }
 
+const GMGN_RECON_THROTTLE_MS = 150;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Pick the highest-liquidity DLMM pool for a base mint from searchPools results.
+ * Only considers pools where the mint is token_x (base side) and pool_type is dlmm
+ * (inferred from bin_step presence — searchPools returns DLMM pools by default).
+ * Returns the pool address + tvl, or null if no DLMM pool found.
+ */
+function pickBestDlmmPoolForMint(searchResult, mint) {
+  if (!searchResult?.pools?.length || !mint) return null;
+  const candidates = searchResult.pools.filter((p) => {
+    const isBase = p.token_x?.mint === mint;
+    const isDlmm = p.bin_step != null;
+    return isBase && isDlmm && Number(p.tvl) > 0;
+  });
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => Number(b.tvl) - Number(a.tvl));
+  return { pool_address: candidates[0].pool, tvl: Number(candidates[0].tvl) };
+}
+
+/**
+ * GMGN trending candidate source — mirrors fetchDiscordSignalCandidates +
+ * refreshDiscordOnlyPools. Fetches 1h-trending SOL tokens (≥ minVolume) from GMGN,
+ * resolves each to its highest-liquidity Meteora DLMM pool via searchPools, then
+ * fetches full 24h metrics via fetchPoolDiscoveryDetail so the pool passes through
+ * the same hard-filter pipeline (getRawPoolScreeningRejectReason, enrichFee24hForPools,
+ * cooldowns, blacklist, etc.) as Meteora-discovery pools.
+ *
+ * Returns [] on keyless / error / no candidates (non-blocking — caller falls back
+ * to Meteora-discovery-only).
+ */
+async function fetchGmgnTrendingPools(timeframe) {
+  const s = config.screening;
+  const trending = await getGmgnTrending({
+    chain: "sol",
+    interval: s.gmgnTrendingInterval || "1h",
+    minVolume: Number(s.gmgnTrendingMinVolume ?? 100_000),
+    limit: Number(s.gmgnTrendingLimit ?? 20),
+    orderBy: s.gmgnTrendingOrderBy || "volume",
+  });
+  if (trending.length === 0) {
+    log("screening", "GMGN trending: no candidates returned");
+    return [];
+  }
+
+  const resolved = [];
+  let resolvedCount = 0;
+  for (const token of trending) {
+    if (!token.mint) continue;
+    // Throttle to avoid 429s on the Meteora data API (matches the recon throttle
+    // used in runScreeningCycle's per-candidate enrichment).
+    if (resolved.length > 0) await sleep(GMGN_RECON_THROTTLE_MS);
+
+    const searchResult = await searchPools({ query: token.mint, limit: 10 }).catch((error) => {
+      log("screening", `GMGN searchPools failed for ${token.symbol || token.mint.slice(0, 8)}: ${error.message}`);
+      return null;
+    });
+    const best = pickBestDlmmPoolForMint(searchResult, token.mint);
+    if (!best) continue;
+    resolvedCount++;
+
+    // Fetch the full metric set (24h window) so getRawPoolScreeningRejectReason
+    // has fee/volume/volatility/organic/holders/mcap/dev/launchpad to gate on.
+    // This is the same call enrichFee24hForPools makes — stamping the 24h fields
+    // directly so the fee/volume gates prefer them (enrichFee24hForPools short-
+    // circuits pools that already have fee_24h + volume_24h).
+    await sleep(GMGN_RECON_THROTTLE_MS);
+    const detail = await fetchPoolDiscoveryDetail({
+      poolAddress: best.pool_address,
+      timeframe: "24h",
+    }).catch((error) => {
+      log("screening", `GMGN pool detail failed for ${token.symbol || best.pool_address.slice(0, 8)}: ${error.message}`);
+      return null;
+    });
+    if (!detail) continue;
+
+    // Stamp the 24h-window fields in the shape enrichFee24hForPools would have,
+    // so the fee/volume gates evaluate against the real 24h window.
+    if (Number.isFinite(Number(detail.fee)) && Number(detail.fee) > 0) detail.fee_24h = Number(detail.fee);
+    if (Number.isFinite(Number(detail.volume)) && Number(detail.volume) > 0) detail.volume_24h = Number(detail.volume);
+    if (Number.isFinite(Number(detail.fee_active_tvl_ratio)) && Number(detail.fee_active_tvl_ratio) > 0) {
+      detail.fee_active_tvl_ratio_24h = Number(detail.fee_active_tvl_ratio);
+    }
+    // Mark origin + attach GMGN's own risk signals for the LLM (do NOT bypass
+    // Meridian's on-chain gates — layered on top for visibility).
+    detail.gmgn_trending = true;
+    detail.gmgn_signals = {
+      symbol: token.symbol,
+      volume_interval: token.volume,
+      liquidity_gmgn: token.liquidity,
+      market_cap: token.market_cap,
+      holder_count: token.holder_count,
+      launchpad: token.launchpad,
+      launchpad_platform: token.launchpad_platform,
+      exchange: token.exchange,
+      rug_ratio: token.rug_ratio,
+      top_10_holder_rate: token.top_10_holder_rate,
+      is_wash_trading: token.is_wash_trading,
+      smart_degen_count: token.smart_degen_count,
+      renowned_count: token.renowned_count,
+      bundler_rate: token.bundler_rate,
+      creator_token_status: token.creator_token_status,
+      creator: token.creator,
+      price_change_percent_1h: token.price_change_percent_1h,
+      trending_rank: token.rank,
+    };
+    resolved.push(detail);
+  }
+
+  log("screening", `GMGN trending: fetched ${trending.length} candidate(s), resolved ${resolvedCount} to DLMM pool(s), ${resolved.length} enriched`);
+  return resolved;
+}
+
 /**
  * Build the Meteora Pool Discovery API filter string for a given tier.
  * Degen = tight envelope (legacy). Midcap = loose ratio dust-floor on the API
@@ -659,10 +778,13 @@ async function fetchTierPools(s, tier, page_size, { timeframe, category } = {}) 
   const tf = timeframe || s.timeframe;
   const cat = category || s.category;
   const filters = buildDiscoveryFilters(s, tier);
+  // When GMGN trending is the only candidate source, skip the Meteora pool-discovery
+  // fetch entirely (saves the API calls) — GMGN-sourced pools feed rawPools below.
+  const gmgnOnly = tier === "degen" && config.screening.useGmgnTrending && config.screening.gmgnSignalMode === "only";
   // The pool-discovery API rejects comma-OR (`pool_type=dlmm,damm_v2` → 0 pools),
   // so fetch each pool_type separately and merge. Parallel to keep latency flat.
   const POOL_TYPES = ["dlmm", "damm_v2"];
-  const pages = await Promise.all(
+  const pages = gmgnOnly ? [] : await Promise.all(
     POOL_TYPES.map((pt) =>
       fetchPoolDiscoveryPage({
         page_size,
@@ -684,6 +806,23 @@ async function fetchTierPools(s, tier, page_size, { timeframe, category } = {}) 
         seen.add(pool.pool_address);
         rawPools.push(pool);
       }
+    }
+  }
+
+  // GMGN trending candidate source (degen tier only, mirrors the Discord merge).
+  if (tier === "degen" && config.screening.useGmgnTrending) {
+    const gmgnPools = await fetchGmgnTrendingPools(tf).catch((error) => {
+      log("screening", `GMGN trending fetch failed: ${error.message}`);
+      return [];
+    });
+    if (config.screening.gmgnSignalMode === "only") {
+      rawPools = gmgnPools;
+    } else if (gmgnPools.length > 0) {
+      const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
+      for (const gmgnPool of gmgnPools) {
+        if (!byPool.has(gmgnPool.pool_address)) byPool.set(gmgnPool.pool_address, gmgnPool);
+      }
+      rawPools = Array.from(byPool.values());
     }
   }
 
@@ -768,7 +907,11 @@ export async function discoverPools({
   const s = config.screening;
 
   const tiers = ["degen"];
-  if (s.midcapEnabled) tiers.push("midcap");
+  // In GMGN-only mode, GMGN trending is the sole candidate source and it only
+  // feeds the degen tier. Running the midcap tier would leak Meteora-discovery
+  // pools (gmgn_trending:false) through, defeating "only" mode. Skip it.
+  const gmgnOnly = config.screening.useGmgnTrending && config.screening.gmgnSignalMode === "only";
+  if (s.midcapEnabled && !gmgnOnly) tiers.push("midcap");
 
   const opts = { timeframe, category };
   const tierResults = await Promise.all(
@@ -1095,6 +1238,11 @@ function condensePool(p) {
     discord_signal_count: p.discord_signal_count || 0,
     discord_signal_seen_count: p.discord_signal_seen_count || 0,
     discord_signal_last_seen_at: p.discord_signal_last_seen_at || null,
+
+    // GMGN trending origin marker + GMGN's own risk signals (layered on top of
+    // Meridian's on-chain gates for LLM visibility — do NOT bypass them).
+    gmgn_trending: Boolean(p.gmgn_trending),
+    gmgn_signals: p.gmgn_signals || null,
 
     // Price action
     price: p.pool_price,

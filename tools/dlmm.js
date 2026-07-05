@@ -9,10 +9,16 @@ import {
   VersionedTransaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import { setDefaultResultOrder } from "dns";
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
+
+// Force IPv4 — the Meteora data APIs (datapi.meteora.ag) intermittently fail to
+// resolve over IPv6, causing searchPools/fetchPoolDiscoveryDetail fetches to
+// hang indefinitely. Same guard as tools/gmgn.js.
+setDefaultResultOrder("ipv4first");
 import {
   trackPosition,
   markOutOfRange,
@@ -1503,10 +1509,16 @@ export async function searchPools({ query, limit = 10 }) {
     pools: pools.map((p) => ({
       pool: p.address || p.pool_address,
       name: p.name,
-      bin_step: p.bin_step ?? p.dlmm_params?.bin_step,
-      fee_pct: p.base_fee_percentage ?? p.fee_pct,
-      tvl: p.liquidity,
-      volume_24h: p.trade_volume_24h,
+      // bin_step is nested under pool_config in the /pools search API response
+      // (the raw shape is { pool_config: { bin_step, base_fee_pct, ... } }),
+      // but other Meteora endpoints surface it at top level. Read both paths.
+      bin_step: p.bin_step ?? p.pool_config?.bin_step ?? p.dlmm_params?.bin_step,
+      fee_pct: p.base_fee_percentage ?? p.pool_config?.base_fee_pct ?? p.fee_pct,
+      // tvl is at top level in the /pools response (liquidity is the reserve
+      // amounts, not pool TVL — using `liquidity` here was wrong; the API field
+      // named `tvl` is the correct pool-wide TVL).
+      tvl: p.tvl ?? p.liquidity,
+      volume_24h: p.trade_volume_24h ?? p.volume?.["24h"],
       token_x: { symbol: p.mint_x_symbol ?? p.token_x?.symbol, mint: p.mint_x ?? p.token_x?.address },
       token_y: { symbol: p.mint_y_symbol ?? p.token_y?.symbol, mint: p.mint_y ?? p.token_y?.address },
     })),
