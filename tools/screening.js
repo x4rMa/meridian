@@ -59,37 +59,66 @@ export function estimateFee24hUsd(pool) {
 }
 
 /**
- * Fetch the real 24h fee for each pool that didn't pass the ratio gate.
- * The linear extrapolation from a 5m slice undercounts real 24h fees badly on
- * short timeframes (a quiet slice can understate by 4-5×), so the absolute-fee
- * gate needs the real number to judge fairly. Pools that already passed the
- * ratio gate skip this fetch (they're in regardless of the fee floor).
+ * Fetch the real 24h fee AND volume for every pool.
+ * The configured screening timeframe (often 5m) undercounts 24h activity badly
+ * for pools that are momentarily quiet — a single dead 5m slice can read
+ * volume=0 fee=0 even on a pool doing $4K+ in daily fees. The fee/active-TVL
+ * and volume gates are therefore evaluated against the real 24h window, not
+ * the timeframe window. Fetches both fields in one detail call per pool.
+ *
+ * The 5m fee_active_tvl_ratio is unreliable for the same reason, so this also
+ * stamps a 24h-derived ratio (fee_24h / active_tvl) where the ratio gate can use it.
  */
 async function enrichFee24hForPools(rawPools, s, tier) {
   if (!Array.isArray(rawPools) || rawPools.length === 0) return;
-  if (tier !== "midcap") return; // only the midcap tier uses the absolute-fee floor
+  // Both tiers need the real 24h window — the configured-timeframe slice is too
+  // noisy to gate on. The midcap tier additionally uses the absolute-fee floor,
+  // but the 24h fetch is the same call, so run it unconditionally.
   const needsFetch = rawPools.filter((pool) => {
-    const ratio = Number(pool?.fee_active_tvl_ratio);
-    const ratioFloor = Number(s.midcapMinFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio);
-    return !(Number.isFinite(ratio) && Number.isFinite(ratioFloor) && ratio >= ratioFloor);
+    // Already enriched (e.g. Discord signal path) — skip the extra round-trip.
+    const hasFee = Number.isFinite(Number(pool?.fee_24h)) && Number(pool.fee_24h) > 0;
+    const hasVol = Number.isFinite(Number(pool?.volume_24h)) && Number(pool.volume_24h) > 0;
+    return !(hasFee && hasVol);
   });
   if (needsFetch.length === 0) return;
 
   const results = await Promise.allSettled(
     needsFetch.map((pool) =>
       fetchPoolDiscoveryDetail({ poolAddress: pool.pool_address, timeframe: "24h" })
-        .then((detail) => ({ poolAddress: pool.pool_address, fee: numeric(detail?.fee) }))
+        .then((detail) => ({
+          poolAddress: pool.pool_address,
+          fee: numeric(detail?.fee),
+          volume: numeric(detail?.volume),
+          ratio: numeric(detail?.fee_active_tvl_ratio),
+          volatility: numeric(detail?.volatility),
+        }))
     )
   );
   let enriched = 0;
   for (const result of results) {
     if (result.status !== "fulfilled") continue;
-    const { poolAddress, fee } = result.value;
-    if (!Number.isFinite(fee) || fee <= 0) continue;
+    const { poolAddress, fee, volume, ratio, volatility } = result.value;
     const pool = rawPools.find((p) => p.pool_address === poolAddress);
-    if (pool) { pool.fee_24h = fee; enriched++; }
+    if (!pool) continue;
+    if (Number.isFinite(fee) && fee > 0) pool.fee_24h = fee;
+    if (Number.isFinite(volume) && volume > 0) pool.volume_24h = volume;
+    // 24h fee/active-TVL ratio — stored separately so the gate can prefer it
+    // over the noisy timeframe ratio. A momentarily-quiet 5m slice reads
+    // ratio≈0 even on a pool doing 0.93/day, so the timeframe ratio is not a
+    // trustworthy gate input. The timeframe ratio is kept for scoring.
+    if (Number.isFinite(ratio) && ratio > 0) pool.fee_active_tvl_ratio_24h = ratio;
+    // 24h volatility — stamped onto the canonical `volatility` field when the
+    // timeframe+volatility-timeframe fetches both returned 0. A pool that's been
+    // quiet for >30m but traded in the last 24h has real price variance that
+    // the 24h window captures and the 30m window misses. Tag the timeframe so
+    // diagnostics reflect which window the volatility came from.
+    if (Number.isFinite(volatility) && volatility > 0 && !isUsableVolatility(pool.volatility)) {
+      pool.volatility = volatility;
+      pool.volatility_timeframe = "24h";
+    }
+    enriched++;
   }
-  if (enriched > 0) log("screening", `midcap: fetched real 24h fee for ${enriched}/${needsFetch.length} ratio-failed pool(s)`);
+  if (enriched > 0) log("screening", `${tier}: fetched real 24h fee/volume for ${enriched}/${needsFetch.length} pool(s)`);
 }
 
 /**
@@ -101,7 +130,15 @@ async function enrichFee24hForPools(rawPools, s, tier) {
  * minFee24hUsd=null disables the absolute floor (pure ratio mode, the legacy behavior).
  */
 export function passesFeeGate(pool, { minFeeActiveTvlRatio, minFee24hUsd = null }) {
-  const ratio = Number(pool?.fee_active_tvl_ratio);
+  // Prefer the 24h fee/active-TVL ratio when available — the timeframe ratio
+  // (often 5m) reads near-zero on momentarily-quiet pools and structurally
+  // rejects healthy daily-fee pools. Fall back to the timeframe ratio only
+  // if the 24h fetch failed.
+  const ratio24h = Number(pool?.fee_active_tvl_ratio_24h);
+  const ratioTf = Number(pool?.fee_active_tvl_ratio);
+  const ratio = (Number.isFinite(ratio24h) && ratio24h > 0)
+    ? ratio24h
+    : (Number.isFinite(ratioTf) ? ratioTf : NaN);
   if (Number.isFinite(ratio) && Number.isFinite(minFeeActiveTvlRatio) && ratio >= minFeeActiveTvlRatio) {
     return true;
   }
@@ -246,7 +283,19 @@ export function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   if (mcap == null || mcap < minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${minMcap}`;
   if (mcap > maxMcap) return `mcap ${mcap} above maxMcap ${maxMcap}`;
   if (holders == null || holders < minHolders) return `holders ${holders ?? "unknown"} below minHolders ${minHolders}`;
-  if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
+  // Volume gate: evaluate against the real 24h window (enriched by
+  // enrichFee24hForPools), not the configured-timeframe slice. A momentarily
+  // quiet 5m window reads volume=0 even on an active pool, which would
+  // structurally reject healthy pools. Fall back to timeframe volume only if
+  // the 24h fetch failed — and then only admit it if nonzero (a true 0 on both
+  // windows means genuinely dead).
+  const volume24h = numeric(pool?.volume_24h);
+  const effectiveVolume = (Number.isFinite(volume24h) && volume24h > 0)
+    ? volume24h
+    : (Number.isFinite(volume) && volume > 0 ? volume : 0);
+  if (effectiveVolume < s.minVolume) {
+    return `24h volume ${effectiveVolume.toFixed(0)} below minVolume ${s.minVolume}`;
+  }
   if (tvl == null || tvl < minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${minTvl}`;
   if (maxTvl != null && tvl > maxTvl) return `TVL ${tvl} above maxTvl ${maxTvl}`;
 
@@ -281,8 +330,10 @@ export function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
 
   if (!passesFeeGate(pool, feeGateOpts)) {
     const fee24h = estimateFee24hUsd(pool);
+    const ratio24h = numeric(pool?.fee_active_tvl_ratio_24h);
+    const shownRatio = (Number.isFinite(ratio24h) && ratio24h > 0) ? ratio24h : feeActiveTvlRatio;
     const floorStr = feeGateOpts.minFee24hUsd != null ? ` OR fee_24h $${fee24h.toFixed(0)} < $${feeGateOpts.minFee24hUsd}` : "";
-    return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below ${feeGateOpts.minFeeActiveTvlRatio}${floorStr}`;
+    return `fee/active-TVL ${shownRatio ?? "unknown"} below ${feeGateOpts.minFeeActiveTvlRatio}${floorStr}`;
   }
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
@@ -566,11 +617,6 @@ function buildDiscoveryFilters(s, tier) {
   const minOrganic     = isMidcap ? (s.midcapMinOrganic ?? s.minOrganic)      : s.minOrganic;
   const minQuoteOrganic = isMidcap ? (s.midcapMinOrganic ?? s.minQuoteOrganic): s.minQuoteOrganic;
   const maxTokenAgeHours = isMidcap ? (s.midcapMaxTokenAgeHours ?? s.maxTokenAgeHours) : s.maxTokenAgeHours;
-  // API ratio floor: midcap uses a loose dust-floor so the absolute-fee OR gate
-  // (which runs post-fetch) gets a chance to admit fat-fee large pools.
-  const apiFeeRatioFloor = isMidcap
-    ? Math.min(s.midcapMinFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, 0.001)
-    : s.minFeeActiveTvlRatio;
 
   return [
     "base_token_has_critical_warnings=false",
@@ -583,13 +629,17 @@ function buildDiscoveryFilters(s, tier) {
     `base_token_market_cap>=${minMcap}`,
     `base_token_market_cap<=${maxMcap}`,
     `base_token_holders>=${minHolders}`,
-    `volume>=${s.minVolume}`,
+    // NOTE: volume>= and fee_active_tvl_ratio>= are NOT in the API filter string.
+    // The configured screening timeframe (often 5m) reads volume=0 fee=0 on any
+    // momentarily-quiet pool, and the API AND-filters server-side so a single
+    // zero slice drops the pool entirely (TripleT-SOL was lost this way despite
+    // $4K+ daily fees). Both gates run post-fetch in getRawPoolScreeningRejectReason
+    // against the real 24h window enriched by enrichFee24hForPools.
     `tvl>=${minTvl}`,
     maxTvl != null ? `tvl<=${maxTvl}` : null,
     // dlmm_bin_step API filter dropped: it excludes DAMM v2 pools (no bin_step).
     // bin_step bounds are enforced in-code in getRawPoolScreeningRejectReason,
     // which is DLMM-only — DAMM pools hit the range gate there instead.
-    `fee_active_tvl_ratio>=${apiFeeRatioFloor}`,
     `base_token_organic_score>=${minOrganic}`,
     `quote_token_organic_score>=${minQuoteOrganic}`,
     s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
@@ -838,7 +888,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         return false;
       }
       if (!passesFeeGate(p, tierFeeGateOpts)) {
-        const ratio = Number.isFinite(Number(p.fee_active_tvlRatio)) ? p.fee_active_tvl_ratio : "unknown";
+        const ratio24h = Number(p?.fee_active_tvl_ratio_24h);
+        const ratio = (Number.isFinite(ratio24h) && ratio24h > 0) ? ratio24h : (Number.isFinite(Number(p.fee_active_tvl_ratio)) ? p.fee_active_tvl_ratio : "unknown");
         const fee24h = estimateFee24hUsd(p);
         const floorStr = tierFeeGateOpts.minFee24hUsd != null ? ` OR fee_24h $${fee24h.toFixed(0)} < $${tierFeeGateOpts.minFee24hUsd}` : "";
         pushFilteredReason(filteredOut, p, `fee/active-TVL ${ratio} below ${tierFeeGateOpts.minFeeActiveTvlRatio}${floorStr} (${tier})`);
@@ -1010,9 +1061,11 @@ function condensePool(p) {
     tvl: round(p.tvl),
     active_tvl: round(p.active_tvl),
     fee_window: round(p.fee),
-    fee_24h: round(p.fee_24h) ?? null, // real 24h fee (midcap only, from enrichFee24hForPools)
+    fee_24h: round(p.fee_24h) ?? null, // real 24h fee (from enrichFee24hForPools)
     volume_window: round(p.volume),
+    volume_24h: round(p.volume_24h) ?? null, // real 24h volume (from enrichFee24hForPools)
     fee_active_tvl_ratio: p.fee_active_tvl_ratio != null ? fix(p.fee_active_tvl_ratio, 4) : null,
+    fee_active_tvl_ratio_24h: p.fee_active_tvl_ratio_24h != null ? fix(p.fee_active_tvl_ratio_24h, 4) : null,
     volatility: fix(p.volatility, 4),
     volatility_timeframe: p.volatility_timeframe || getVolatilityTimeframe(config.screening.timeframe),
 
