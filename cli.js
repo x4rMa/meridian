@@ -9,16 +9,17 @@ import { parseArgs } from "util";
 import os from "os";
 import fs from "fs";
 import path from "path";
+import { repoPath, DATA_ROOT } from "./repo-root.js";
 
 // ─── DRY_RUN must be set before any tool imports ─────────────────
 if (process.argv.includes("--dry-run")) process.env.DRY_RUN = "true";
 
-// ─── Load .env from ~/.meridian/ if present ──────────────────────
-const meridianDir = path.join(os.homedir(), ".meridian");
-const meridianEnv = path.join(meridianDir, ".env");
-if (fs.existsSync(meridianEnv)) {
+// ─── Load .env ───────────────────────────────────────────────────
+// Resolution: MERIDIAN_HOME/.env  →  ~/.meridian/.env (legacy)  →  repo .env
+if (!process.env.MERIDIAN_HOME && fs.existsSync(path.join(os.homedir(), ".meridian", ".env"))) {
+  const meridianDir = path.join(os.homedir(), ".meridian");
   loadEnv({
-    envPath: meridianEnv,
+    envPath: path.join(meridianDir, ".env"),
     keyPath: path.join(meridianDir, ".envrypt"),
     override: false,
   });
@@ -37,7 +38,7 @@ function die(msg, extra = {}) {
 // ─── SKILL.md generation ──────────────────────────────────────────
 const SKILL_MD = `# meridian — Solana DLMM LP Agent CLI
 
-Data dir: ~/.meridian/
+Data dir: $MERIDIAN_HOME (or repo root if unset)
 
 ## Commands
 
@@ -604,7 +605,7 @@ switch (subcommand) {
 
   // ── discord-signals ──────────────────────────────────────────────
   case "discord-signals": {
-    const sigFile = path.join(process.cwd(), "discord-signals.json");
+    const sigFile = repoPath("discord-signals.json");
     if (!fs.existsSync(sigFile)) {
       out({ count: 0, pending: 0, signals: [], message: "No discord-signals.json found. Is the listener running?" });
       break;
