@@ -318,6 +318,16 @@ export const config = {
     stochRsiOverbought: indicatorUserConfig.stochRsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
   },
+
+  // ─── Markov Chain Analysis ─────────────
+  // Per-token price-state transition matrices built from closed-position history.
+  // Predicts the next state (DOWNTREND/STABLE/UPTREND/PUMPED_OOR/DRIFTED_OOR) to
+  // inform entry/exit decisions. Falls back silently when a pool has <3 closes.
+  markov: {
+    enabled:       u.markovEnabled      ?? false,
+    windowMinutes: u.markovWindowMinutes ?? 60,   // lookback window for snapshot-based current-state detection
+    thresholdPct:  u.markovThresholdPct  ?? 65,   // confidence floor before acting on a prediction
+  },
 };
 
 /**

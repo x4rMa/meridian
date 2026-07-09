@@ -994,6 +994,30 @@ Also useful during screening to skip pools with a bad track record.`,
   {
     type: "function",
     function: {
+      name: "get_markov_state",
+      description: `Get the Markov chain transition matrix and next-state prediction for a pool.
+Returns the current price-trend state (DOWNTREND/STABLE/UPTREND/PUMPED_OOR/DRIFTED_OOR),
+the predicted next state with confidence %, per-state transition probabilities, and entropy.
+Requires 3+ closed deploys on the pool to build a matrix.
+
+Use during screening to check state stability before deploying, and during management
+to predict whether a position's pool is trending toward a downtrend.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "The pool address to analyze"
+          }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "add_pool_note",
       description: `Annotate a pool with a freeform note that persists across sessions.
 Use when you observe something worth remembering about a specific pool:

@@ -9,12 +9,13 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, swapToken } from "./wallet.js";
+import { getWalletBalances, swapToken, getTokenBalance } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { getMarkovState } from "../markov.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
@@ -374,8 +375,9 @@ function normalizeConfigValue(key, value) {
     "midcapBypassIndicators",
     "midcapBypassTimingFilters",
     "useGmgnTrending",
+    "markovEnabled",
   ]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -470,6 +472,7 @@ const toolMap = {
   set_active_strategy: setActiveStrategy,
   remove_strategy:     removeStrategy,
   get_pool_memory: getPoolMemory,
+  get_markov_state: getMarkovState,
   add_pool_note: addPoolNote,
   add_to_blacklist: addToBlacklist,
   remove_from_blacklist: removeFromBlacklist,
@@ -651,6 +654,10 @@ const toolMap = {
       stochRsiOversold: ["indicators", "stochRsiOversold", ["chartIndicators", "stochRsiOversold"]],
       stochRsiOverbought: ["indicators", "stochRsiOverbought", ["chartIndicators", "stochRsiOverbought"]],
       requireAllIntervals: ["indicators", "requireAllIntervals", ["chartIndicators", "requireAllIntervals"]],
+      // markov
+      markovEnabled: ["markov", "enabled"],
+      markovWindowMinutes: ["markov", "windowMinutes"],
+      markovThresholdPct: ["markov", "thresholdPct"],
     };
 
     const applied = {};
@@ -803,13 +810,28 @@ async function swapBaseToSolWithRetry(baseMint, label) {
   let lastErr = null;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const balances = await getWalletBalances({});
-      const token = balances.tokens?.find((t) => t.mint === baseMint);
-      if (!token || token.usd < 0.10) {
-        // Nothing left to swap (already sold or dust) — treat as done.
+      // Read the raw on-chain SPL balance (Helius-free). The previous
+      // implementation went through getWalletBalances, which returns
+      // tokens:[] when HELIUS_API_KEY is unset — so the base token was
+      // never found and every close left its residue behind.
+      const token = await getTokenBalance(baseMint);
+      if (!token || !token.balance || token.balance <= 0) {
+        // Nothing left to swap (already sold) — treat as done.
         return { swapped: attempt > 1, result: null, token: null };
       }
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL (attempt ${attempt}/${attempts})`);
+      // Optional USD sanity gate (only when Helius pricing is available);
+      // never blocks the swap when pricing is unknown.
+      let usd = null;
+      try {
+        const balances = await getWalletBalances({});
+        const t = balances.tokens?.find((x) => x.mint === baseMint);
+        if (t?.usd != null) usd = t.usd;
+      } catch {}
+      if (usd != null && usd < 0.10) {
+        return { swapped: false, result: null, token: null };
+      }
+      const usdTag = usd != null ? ` ($${usd.toFixed(2)})` : "";
+      log("executor", `Auto-swapping ${label} ${baseMint.slice(0, 8)}${usdTag} back to SOL (attempt ${attempt}/${attempts})`);
       const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
       const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
       if (ok) return { swapped: true, result: swapResult, token };

@@ -118,10 +118,12 @@ export function recordPoolDeploy(poolAddress, deployData) {
       last_deployed_at: null,
       last_outcome: null,
       notes: [],
+      markov_matrix: null,
     };
   }
 
   const entry = db[poolAddress];
+  if (!entry.markov_matrix) entry.markov_matrix = null;
 
   const deploy = {
     deployed_at: deployData.deployed_at || null,
@@ -280,7 +282,20 @@ export function getPoolMemory({ pool_address }) {
     base_mint_cooldown_reason: entry.base_mint_cooldown_reason || null,
     notes: entry.notes,
     history: entry.deploys.slice(-10), // last 10 deploys
+    markov_matrix: entry.markov_matrix || null,
   };
+}
+
+/**
+ * Persist a Markov transition matrix cache onto a pool entry.
+ * Called by markov.js after re-deriving the matrix from deploys[].
+ */
+export function setMarkovMatrix(poolAddress, matrix) {
+  if (!poolAddress) return;
+  const db = load();
+  if (!db[poolAddress]) return;
+  db[poolAddress].markov_matrix = matrix;
+  save(db);
 }
 
 /**
@@ -306,10 +321,12 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
       last_outcome: null,
       notes: [],
       snapshots: [],
+      markov_matrix: null,
     };
   }
 
   if (!db[poolAddress].snapshots) db[poolAddress].snapshots = [];
+  if (!db[poolAddress].markov_matrix) db[poolAddress].markov_matrix = null;
 
   db[poolAddress].snapshots.push({
     ts: new Date().toISOString(),

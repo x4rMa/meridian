@@ -4,8 +4,8 @@ import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
-const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
+const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance", "get_markov_state"]);
+const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions", "get_markov_state"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
   "update_config",
@@ -29,7 +29,7 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
 // Intent → tool subsets for GENERAL role
 const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
-  deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
+  deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note", "get_markov_state"]),
   close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
   claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
@@ -39,7 +39,7 @@ const INTENT_TOOLS = {
   balance:     new Set(["get_wallet_balance", "get_my_positions", "get_wallet_positions"]),
   positions:   new Set(["get_my_positions", "get_position_pnl", "get_wallet_balance", "set_position_note", "get_wallet_positions"]),
   strategy:    new Set(["list_strategies", "get_strategy", "add_strategy", "update_strategy", "delete_strategy", "remove_strategy", "set_active_strategy"]),
-  screen:      new Set(["get_top_candidates", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "check_smart_wallets_on_pool", "get_pool_detail", "get_my_positions", "discover_pools"]),
+  screen:      new Set(["get_top_candidates", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "check_smart_wallets_on_pool", "get_pool_detail", "get_my_positions", "discover_pools", "get_markov_state"]),
   memory:      new Set(["get_pool_memory", "add_pool_note", "list_blacklist", "add_to_blacklist", "remove_from_blacklist"]),
   smartwallet: new Set(["add_smart_wallet", "remove_smart_wallet", "list_smart_wallets", "check_smart_wallets_on_pool"]),
   study:       new Set(["study_top_lpers", "get_top_lpers", "get_pool_detail", "search_pools", "get_token_info", "discover_pools", "add_smart_wallet", "list_smart_wallets"]),
@@ -170,7 +170,14 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       if (config.darwin?.enabled) weightsSummary = getWeightsSummary();
     } catch { /* signal-weights not critical */ }
   }
-  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, weightsSummary, decisionSummary);
+  let markovSummary = null;
+  if (config.markov?.enabled) {
+    try {
+      const { getMarkovSummary } = await import("./markov.js");
+      markovSummary = getMarkovSummary();
+    } catch { /* markov not critical */ }
+  }
+  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, weightsSummary, decisionSummary, markovSummary);
 
   let providerMode = "system";
   let messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
@@ -180,6 +187,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const ONCE_PER_SESSION = new Set(["deploy_position", "swap_token", "close_position"]);
   // These lock after first attempt regardless of success — retrying them is always wrong
   const NO_RETRY_TOOLS = new Set(["deploy_position"]);
+  // Key the lock by target, not tool name. A failed/blocked deploy on pool A must NOT
+  // block a legitimate switch to pool B in the same session — only identical-target
+  // retries are suppressed (which is the actual LLM failure mode we guard against).
+  const sessionLockKey = (name, args) => {
+    if (!args || typeof args !== "object") return name;
+    if (name === "deploy_position") return `${name}:${args.pool_address ?? args.pool ?? ""}`;
+    if (name === "close_position") return `${name}:${args.position_address ?? args.position ?? ""}`;
+    if (name === "swap_token") return `${name}:${args.input_mint ?? ""}→${args.output_mint ?? ""}`;
+    return name;
+  };
   const firedOnce = new Set();
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
@@ -352,20 +369,23 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           }
         }
 
-        // Block once-per-session tools from firing a second time
-        if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName)) {
-          log("agent", `Blocked duplicate ${functionName} call — already executed this session`);
+        // Block once-per-session tools from firing a second time on the SAME target.
+        // A different pool/position/swap-pair is allowed (switching candidates after a
+        // failed/blocked attempt is legitimate); identical-target retry is not.
+        const lockKey = sessionLockKey(functionName, functionArgs);
+        if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(lockKey)) {
+          log("agent", `Blocked duplicate ${functionName} call on ${lockKey} — already executed this session`);
           await onToolFinish?.({
             name: functionName,
             args: functionArgs,
-            result: { blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` },
+            result: { blocked: true, reason: `${functionName} already attempted this session on ${lockKey} — do not retry the SAME target. If it failed, report the error; you may still switch to a different pool/position/pair if the user asked.` },
             success: false,
             step,
           });
           return {
             role: "tool",
             tool_call_id: toolCall.id,
-            content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
+            content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session on ${lockKey} — do not retry the SAME target. If it failed, report the error; you may still switch to a different pool/position/pair if the user asked.` }),
           };
         }
 
@@ -379,10 +399,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           step,
         });
 
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
-        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
+        // Lock deploy_position after first attempt on a given pool regardless of outcome —
+        // retrying the SAME pool is always wrong. For close/swap: only lock on success so
+        // genuine failures can be retried. Switching to a different pool/position/pair is
+        // never blocked (different lockKey).
+        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(lockKey);
+        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(lockKey);
 
         return {
           role: "tool",

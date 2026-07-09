@@ -568,6 +568,70 @@ node cli.js evolve
 
 This analyzes closed position performance (win rate, avg PnL, fee yields) and automatically adjusts screening thresholds in `user-config.json`. Changes take effect immediately.
 
+### Markov chain analysis
+
+The agent builds a per-pool **Markov transition matrix** from its own closed-position history. Each close is classified into one of 5 discrete price-trend states, and the matrix captures how likely the pool is to transition from one state to the next:
+
+| State | Definition |
+|---|---|
+| `DOWNTREND` | Stop-loss close, or PnL <= -5% |
+| `STABLE` | \|PnL\| < 5% with a neutral close reason (low yield, agent decision) |
+| `UPTREND` | Take-profit / trailing-TP close with PnL >= 5% |
+| `PUMPED_OOR` | Closed because price pumped far above the range |
+| `DRIFTED_OOR` | Closed because price drifted out of range |
+
+The matrix powers two decision pathways:
+
+- **SCREENER** — pools with high Markov entropy (>60%, i.e. unpredictable next state) are tagged `⚠️ high volatility` in the candidate list and the prompt instructs the screener to deprioritize them.
+- **MANAGER** — a high-confidence `DOWNTREND` prediction (>= `markovThresholdPct` confidence, 5+ transitions) triggers deterministic Rule 6, closing the position before the trailing-TP drop fires.
+
+The matrix is re-derived from `pool-memory.json` deploy history on every read — no incremental drift, automatically safe across PM2 restarts. The `markov_matrix` field on each pool entry is a cache, not a source of truth.
+
+**Config** (`user-config.json`):
+
+```json
+"markovEnabled": false,
+"markovWindowMinutes": 60,
+"markovThresholdPct": 65
+```
+
+Defaults to `false`. Enable after the agent has 3+ closes on at least one pool (the minimum to build a matrix). When disabled or when a pool has insufficient history, Markov silently falls back to existing heuristics — no errors, no blocking.
+
+**Query a pool's Markov state:**
+
+```bash
+# CLI
+node cli.js markov <pool_address>
+
+# Telegram
+/markov <pool_address>
+```
+
+Example output:
+```
+📊 Markov Analysis: world-SOL
+Current state: STABLE
+Predicted next: STABLE (100% confidence)
+Transitions: 4 (5 samples)
+Last close: low yield
+
+Transition probabilities:
+  DOWNTREND → none
+  STABLE → STABLE:100%
+  UPTREND → none
+  PUMPED_OOR → none
+  DRIFTED_OOR → STABLE:33%, DRIFTED_OOR:67%
+
+Entropy (volatility):
+  DOWNTREND: 100%
+  STABLE: 0%
+  UPTREND: 100%
+  PUMPED_OOR: 100%
+  DRIFTED_OOR: 40%
+```
+
+The agent can also call the `get_markov_state` tool directly during screening or management to inspect any pool's transition matrix.
+
 ---
 
 ## HiveMind

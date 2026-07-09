@@ -8,6 +8,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 import { repoPath } from "./repo-root.js";
 
@@ -182,6 +183,16 @@ export async function recordPerformance(perf) {
       exit_tvl: perf.exit_tvl,
       exit_volume: perf.exit_volume,
     });
+  }
+
+  // Record Markov transition observation (non-blocking)
+  if (config.markov?.enabled && perf.pool) {
+    try {
+      const { recordTransition } = await import("./markov.js");
+      recordTransition(perf.pool, { pnl_pct: entry.pnl_pct, close_reason: perf.close_reason });
+    } catch (e) {
+      log("markov", `recordTransition skipped: ${e.message}`);
+    }
   }
 
   // Evolve thresholds every 5 closed positions

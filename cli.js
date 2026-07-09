@@ -177,6 +177,13 @@ Returns deploy history for a specific pool from pool-memory.json.
 Output: { pool_address, known, name, total_deploys, win_rate, avg_pnl_pct, last_outcome, notes, history }
 \`\`\`
 
+### meridian markov <pool_address>
+Returns the Markov chain transition matrix and next-state prediction for a pool.
+Requires 3+ closed deploys to build a matrix.
+\`\`\`
+Output: { pool_address, available, pool_name, current_state, predicted_next, confidence, total_transitions, transition_probabilities, entropy }
+\`\`\`
+
 ### meridian evolve
 Runs evolveThresholds() over all closed position data and updates user-config.json.
 \`\`\`
@@ -215,8 +222,8 @@ Starts the autonomous agent with cron jobs (management + screening).
 --silent      Suppress Telegram notifications for this run
 `;
 
-fs.mkdirSync(meridianDir, { recursive: true });
-fs.writeFileSync(path.join(meridianDir, "SKILL.md"), SKILL_MD);
+fs.mkdirSync(DATA_ROOT, { recursive: true });
+fs.writeFileSync(path.join(DATA_ROOT, "SKILL.md"), SKILL_MD);
 
 // ─── Parse args ───────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -669,6 +676,15 @@ switch (subcommand) {
       strategy: flags.strategy || "spot",
       single_sided_x: argv.includes("--single-sided-x"),
     }));
+    break;
+  }
+
+  // ── markov <pool_address> ───────────────────────────────────────
+  case "markov": {
+    const poolAddr = flags.pool || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "markov");
+    if (!poolAddr) die("Usage: meridian markov <pool_address>");
+    const { getMarkovState } = await import("./markov.js");
+    out(await getMarkovState({ pool_address: poolAddr }));
     break;
   }
 

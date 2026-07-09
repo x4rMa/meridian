@@ -28,6 +28,7 @@ import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { predictNextState, getMarkovSummary, calculateTransitionMatrix } from "./markov.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -295,26 +296,26 @@ export async function runManagementCycle({ silent = false } = {}) {
 
     const reportLines = positionData.map((p) => {
       const act = actionMap.get(p.position);
-      const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
+      const inRange = p.in_range ? "🟢" : `🔴OOR${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
-      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
-      if (p.instruction) line += `\nNote: "${p.instruction}"`;
-      if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
-      if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
-      if (act.action === "CLAIM") line += `\n→ Claiming fees`;
+      const statusLabel = act.action === "INSTRUCTION" ? "HOLD*" : act.action;
+      let line = `${inRange} **${p.pair}** | ${p.age_minutes ?? "?"}m | ${val} | fee ${unclaimed} | PnL ${p.pnl_pct ?? "?"}% | y${p.fee_per_tvl_24h ?? "?"}% | ${statusLabel}`;
+      if (p.instruction) line += ` | note: ${p.instruction}`;
+      if (act.action === "CLOSE" && act.rule === "exit") line += ` | ⚡${act.reason}`;
+      if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += ` | R${act.rule}:${act.reason}`;
+      if (act.action === "CLAIM") line += ` | →claim`;
       return line;
     });
 
     const needsAction = [...actionMap.values()].filter(a => a.action !== "STAY");
     const actionSummary = needsAction.length > 0
-      ? needsAction.map(a => a.action === "INSTRUCTION" ? "EVAL instruction" : `${a.action}${a.reason ? ` (${a.reason})` : ""}`).join(", ")
+      ? needsAction.map(a => a.action === "INSTRUCTION" ? "EVAL*" : `${a.action}${a.reason ? ` (${a.reason})` : ""}`).join(", ")
       : "no action";
 
     const cur = config.management.solMode ? "◎" : "$";
-    mgmtReport = reportLines.join("\n\n") +
-      `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
+    mgmtReport = reportLines.join("\n") +
+      `\n💼 ${positions.length} pos | ${cur}${totalValue.toFixed(4)} | fees ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
     // ── Call LLM only if action needed ──────────────────────────────
     const actionPositions = positionData.filter(p => {
@@ -514,11 +515,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
     if (passing.length === 0) {
       const combined = filteredOut.length > 0 ? filteredOut : earlyFilteredExamples;
       const combinedExamples = combined.slice(0, 3)
-        .map((entry) => `- ${entry.name}: ${entry.reason}`)
-        .join("\n");
+        .map((entry) => `${entry.name}: ${entry.reason}`)
+        .join(" | ");
       screenReport = combinedExamples
-        ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
-        : `No candidates available (all filtered by launchpad / holder-quality rules).`;
+        ? `⛔ NO DEPLOY\nNo candidates — ${combinedExamples}`
+        : `⛔ NO DEPLOY\nNo candidates (filtered by launchpad/holder-quality rules).`;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
@@ -535,17 +536,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
         const candidateName = passing[0].pool?.name || "unknown";
         screenReport = [
           "⛔ NO DEPLOY",
-          "",
-          "Cycle finished with no valid entry.",
-          "",
-          "BEST LOOKING CANDIDATE",
-          candidateName,
-          "",
-          "WHY SKIPPED",
-          `Only one candidate survived filtering, but it was not worth deploying: ${skipReason}.`,
-          "",
-          "REJECTED",
-          `- ${candidateName}: ${skipReason}`,
+          `Best: ${candidateName} — ${skipReason}.`,
+          `Rejected: ${candidateName} — ${skipReason}`,
         ].join("\n");
         appendDecision({
           type: "no_deploy",
@@ -588,6 +580,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
+        (() => {
+          if (!config.markov?.enabled) return null;
+          try {
+            const m = calculateTransitionMatrix(pool.pool);
+            if (!m) return null;
+            const avgEntropy = Math.round((m.entropy.reduce((s, e) => s + e, 0) / m.entropy.length) * 100);
+            const warn = avgEntropy > 60 ? " ⚠️ high volatility" : "";
+            return `  markov: state=${m.current_state}, next=${m.predicted_next} (${m.confidence}%), entropy=${avgEntropy}%${warn} [${m.totalTransitions} transitions]`;
+          } catch { return null; }
+        })(),
       ].filter(Boolean).join("\n");
 
       // Stage signals for Darwinian weighting — captured before LLM decides
@@ -630,55 +632,22 @@ STEPS:
    pass deploy_position.tier = the candidate's tier (from the [tier: ...] tag in its block) so the bin_step safety check uses the correct range.
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
-4. Report in this exact format (no tables, no extra sections):
-   🚀 DEPLOYED
+4. Report in this exact format (one-liners only, no tables, no extra sections):
+   🚀 DEPLOYED <pool name>
+   <deploy amount> SOL | <strategy> | bin <active_bin> | range <minPrice>→<maxPrice> | cover <downside%>/<upside%>/<width%>
 
-   <pool name>
-   <pool address>
+   Use the actual deploy_position tool result for range_coverage (downside_pct/upside_pct/width_pct). Do NOT calculate them yourself.
 
-   ◎ <deploy amount> SOL | <strategy> | bin <active_bin>
-   Range: <minPrice> → <maxPrice>
-   Range cover: <downside %> downside | <upside %> upside | <total width %> total
+   Fee/TVL <x>% | Vol <vol> | Org <x> | TVL $<x> | Mcap $<x> | Age <x>h
+   Top10 <x>% | Bots <x>% | Fees <x>SOL | SW <names or none>
 
-   IMPORTANT:
-   - Do NOT calculate the range percentages yourself.
-   - Use the actual deploy_position tool result:
-     range_coverage.downside_pct
-     range_coverage.upside_pct
-     range_coverage.width_pct
-
-   MARKET
-   Fee/TVL: <x>%
-   Volume: $<x>
-   TVL: $<x>
-   Volatility: <x>
-   Organic: <x>
-   Mcap: $<x>
-   Age: <x>h
-
-   AUDIT
-   Top10: <x>%
-   Bots: <x>%
-   Fees paid: <x> SOL
-   Smart wallets: <names or none>
-
-   WHY THIS WON
-   <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
+   WHY: <one concise sentence>
 5. If no pool qualifies, report in this exact format instead:
    ⛔ NO DEPLOY
-
-   Cycle finished with no valid entry.
-
-   BEST LOOKING CANDIDATE
-   <name or none>
-
-   WHY SKIPPED
-   <2-4 concise sentences explaining why nothing was good enough>
-
-   REJECTED
-   <short flat list of top candidate names and why they were skipped>
+   Best: <name or none> — <one concise sentence why skipped>
+   Rejected: <short comma list of candidates and why>
 IMPORTANT:
-- Keep the whole report compact and highly scannable for Telegram.
+- Keep the whole report compact: key numbers only, no filler, highly scannable for Telegram.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
@@ -986,6 +955,24 @@ function getDeterministicCloseRule(position, managementConfig) {
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
   }
+
+  // Rule 6: Markov downtrend prediction — high-confidence next-state prediction
+  // that the pool is transitioning into a downtrend. Lets the deterministic layer
+  // exit before the trailing-TP drop triggers, based on historical transition patterns.
+  if (config.markov?.enabled && position.pool) {
+    try {
+      const prediction = predictNextState(position.pool);
+      if (
+        prediction &&
+        prediction.predicted_next === "DOWNTREND" &&
+        prediction.confidence >= (config.markov.thresholdPct ?? 65) &&
+        prediction.totalTransitions >= 5
+      ) {
+        return { action: "CLOSE", rule: 6, reason: "markov downtrend prediction" };
+      }
+    } catch { /* markov not critical — fall through */ }
+  }
+
   return null;
 }
 
@@ -1059,12 +1046,32 @@ function formatConfigSnapshot() {
 }
 
 function parseConfigValue(raw) {
-  const value = String(raw ?? "").trim();
+  let value = String(raw ?? "").trim();
   if (!value.length) return "";
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    const inner = value.slice(1, -1).trim();
+    if (
+      (inner.startsWith("[") && inner.endsWith("]")) ||
+      (inner.startsWith("{") && inner.endsWith("}"))
+    ) {
+      try {
+        return JSON.parse(inner);
+      } catch {
+        /* fall through — treat as plain string */
+      }
+    }
+    value = inner;
+  }
   if (/^(true|false)$/i.test(value)) return value.toLowerCase() === "true";
   if (/^null$/i.test(value)) return null;
   if (/^-?\d+(\.\d+)?$/.test(value)) return Number(value);
-  if ((value.startsWith("[") && value.endsWith("]")) || (value.startsWith("{") && value.endsWith("}"))) {
+  if (
+    (value.startsWith("[") && value.endsWith("]")) ||
+    (value.startsWith("{") && value.endsWith("}"))
+  ) {
     return JSON.parse(value);
   }
   return value;
@@ -1328,6 +1335,7 @@ function formatHelpText() {
     "/setcfg <key> <value> — update persisted config",
     "/screen — refresh deterministic candidate list",
     "/candidates — show latest cached candidates",
+    "/markov <pool_addr> — Markov state analysis for a pool",
     "/deploy <n> — deploy candidate by cached index",
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
@@ -1624,6 +1632,39 @@ async function telegramHandler(msg) {
     return;
   }
 
+  const markovMatch = text.match(/^\/markov\s+(\S+)$/i);
+  if (markovMatch) {
+    try {
+      const { getMarkovState } = await import("./markov.js");
+      const result = getMarkovState({ pool_address: markovMatch[1] });
+      if (!result || result.available === false) {
+        await sendMessage(`No Markov data for ${markovMatch[1].slice(0, 8)} — ${result?.message || "insufficient history (need 3+ closes)"}`).catch(() => {});
+        return;
+      }
+      const probLines = Object.entries(result.transition_probabilities || {}).map(([from, row]) => {
+        const dest = Object.entries(row).filter(([, p]) => p > 0).map(([to, p]) => `${to}:${Math.round(p * 100)}%`).join(", ");
+        return `  ${from} → ${dest || "none"}`;
+      });
+      const msg = [
+        `📊 Markov Analysis: ${result.pool_name}`,
+        `Current state: ${result.current_state}`,
+        `Predicted next: ${result.predicted_next} (${result.confidence}% confidence)`,
+        `Transitions: ${result.total_transitions} (${result.sample_count} samples)`,
+        `Last close: ${result.last_close_reason || "unknown"}`,
+        ``,
+        `Transition probabilities:`,
+        ...probLines,
+        ``,
+        `Entropy (volatility):`,
+        ...Object.entries(result.entropy || {}).map(([s, e]) => `  ${s}: ${Math.round(e * 100)}%`),
+      ].join("\n");
+      await sendMessage(msg).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
   const deployMatch = text.match(/^\/deploy\s+(\d+)$/i);
   if (deployMatch) {
     try {
@@ -1865,6 +1906,7 @@ Commands:
   auto           Let the agent pick and deploy automatically
   /status        Refresh wallet + positions
   /candidates    Refresh top pool list
+  /markov <addr> Markov state analysis for a pool
   /briefing      Show morning briefing (last 24h)
   /learn         Study top LPers from the best current pool and save lessons
   /learn <addr>  Study top LPers from a specific pool address

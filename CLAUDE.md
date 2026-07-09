@@ -104,6 +104,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `decision-log.js` | 68 | Rolling 100-entry log. Types: `deploy` / `close` / `skip` / `no_deploy`. Each entry: actor, pool, summary, reason, risks[], metrics{}, rejected[]. Surfaced via `get_recent_decisions` tool and `getDecisionSummary()` in the prompt. |
 | `signal-tracker.js` | 87 | In-memory 10-min staging for screening-time signals (`organic_score`, `fee_tvl_ratio`, …). Cleared on deploy or TTL. **Not persisted** — fine because the staged snapshot is also written to `state.json` via `trackPosition({ signal_snapshot })`. |
 | `signal-weights.js` | 330 | Darwinian signal weighting. Recalculates every 5 closes (or 10-sample min). Splits signals into quartiles; top → `weight*1.05`, bottom → `weight*0.95`. Persists `signal-weights.json`. `getWeightsSummary()` injected into SCREENER prompt. |
+| `markov.js` | ~220 | Per-pool Markov chain price-state transition matrices. 5 states (DOWNTREND/STABLE/UPTREND/PUMPED_OOR/DRIFTED_OOR). `classifyState()`, `calculateTransitionMatrix()` (re-derives from pool-memory deploys, caches in `markov_matrix` field), `predictNextState()`, `recordTransition()` (called from `recordPerformance`), `getMarkovSummary()` (injected into all 3 role prompts), `getMarkovState()` (tool handler). Gated by `config.markov.enabled`. Non-blocking: returns null on <3 deploys. Rule 6 in `getDeterministicCloseRule` uses high-confidence DOWNTREND predictions. |
 | `strategy-library.js` | 227 | Saved LP strategies. Five defaults preloaded: `custom_ratio_spot`, `single_sided_reseed`, `fee_compounding`, `multi_layer`, `partial_harvest`. `getActiveStrategy()` → used in SCREENER prompt. |
 | `smart-wallets.js` | 103 | Tracked KOL/alpha wallets. `type: "lp"` (default) checks positions; `type: "holder"` only checks token holdings. 5-min position cache. `check_smart_wallets_on_pool` is the deployment confidence signal. |
 | `token-blacklist.js` | 103 | Mint → reason. Hard-filtered before LLM in `getTopCandidates`. |
@@ -302,6 +303,7 @@ All persistent files are loaded/saved on each call — no in-memory caching laye
 | `api` | `url`, `publicApiKey`, `lpAgentRelayEnabled` | `https://api.agentmeridian.xyz/api`, built-in key, false |
 | `jupiter` | `apiKey`, `referralAccount`, `referralFeeBps` | env override, fixed referral, 50 bps |
 | `indicators` | `enabled`, `entryPreset`, `exitPreset`, `rsiLength`, `intervals`, `candles`, `rsiOversold`, `rsiOverbought`, `requireAllIntervals` | false, supertrend_break, supertrend_break, 2, ["5_MINUTE"], 298, 30, 80, false |
+| `markov` | `enabled`, `windowMinutes`, `thresholdPct` | false, 60, 65 |
 
 `update_config` (executor.js:333) uses a flat-key `CONFIG_MAP` (50+ entries) that knows how to (a) coerce booleans/arrays/strings/numbers, (b) clamp `binsBelow*` to `MIN_SAFE_BINS_BELOW=35`, (c) restart cron if `managementIntervalMin` / `screeningIntervalMin` changed, (d) write a `[SELF-TUNED]` lesson.
 

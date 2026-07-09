@@ -131,6 +131,29 @@ export async function getWalletBalances() {
 }
 
 /**
+ * Read a token's raw on-chain balance for the wallet via RPC (Helius-free).
+ * Returns { balance, decimals } in UI units, or null if no account / zero.
+ * Used by the auto-swap-on-close path so it works without HELIUS_API_KEY.
+ */
+export async function getTokenBalance(mint) {
+  mint = normalizeMint(mint);
+  if (mint === SOL_MINT) {
+    const lamports = await getConnection().getBalance(getWallet().publicKey);
+    return { balance: lamports / LAMPORTS_PER_SOL, decimals: 9 };
+  }
+  const { getAssociatedTokenAddress, getAccount } = await import("@solana/spl-token");
+  const ata = await getAssociatedTokenAddress(new PublicKey(mint), getWallet().publicKey);
+  try {
+    const acc = await getAccount(getConnection(), ata);
+    const info = await getConnection().getParsedAccountInfo(new PublicKey(mint));
+    const decimals = info.value?.data?.parsed?.info?.decimals ?? 6;
+    return { balance: Number(acc.amount.toString()) / Math.pow(10, decimals), decimals };
+  } catch {
+    return null; // ATA doesn't exist or closed → nothing to swap
+  }
+}
+
+/**
  * Swap tokens via Jupiter Swap API V2 (order → sign → execute).
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
