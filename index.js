@@ -29,6 +29,7 @@ import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTracke
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { predictNextState, getMarkovSummary, calculateTransitionMatrix } from "./markov.js";
+import { logTick as researchLogTick, logTrigger as researchLogTrigger, logClose as researchLogClose } from "./stop-research.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -748,6 +749,11 @@ Summarize the current portfolio health, total fees earned, and performance of al
       for (const p of result.positions) {
         confirmPeak(p.position, p.pnl_pct, confirmTicks);
 
+        // Stop-research: observe every tick inside the [-12%, -4%] band.
+        // Pure observation — never affects whether the position closes.
+        const tracked = getTrackedPosition(p.position);
+        researchLogTick(p, tracked?.peak_pnl_pct);
+
         // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
         const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
@@ -760,6 +766,19 @@ Summarize the current portfolio health, total fees earned, and performance of al
         const ticksNeeded = signal === "STOP_LOSS" ? 1 : confirmTicks;
         const { fire } = registerExitSignal(p.position, signal, ticksNeeded);
         if (!signal || !fire) continue;
+
+        // Stop-research: on a STOP_LOSS fire, record the trigger and schedule
+        // counterfactual pnl fetches (+3/+6/+9/+15/+30s) to answer "would
+        // waiting have helped?" — does NOT delay or alter the close below.
+        if (signal === "STOP_LOSS") {
+          researchLogTrigger(p, reason, async (posId) => {
+            try {
+              const res = await getMyPositions({ force: false, silent: true }).catch(() => null);
+              const found = res?.positions?.find((x) => x.position === posId);
+              return found ? found.pnl_pct : null;
+            } catch { return null; }
+          });
+        }
 
         log("state", `[PnL poll] ${signal} confirmed (${ticksNeeded} ticks): ${p.pair} — ${reason} — closing directly`);
         // Hold the management lock so the cron cycle can't double-act on this position.

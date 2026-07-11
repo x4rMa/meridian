@@ -11,6 +11,7 @@ import { log } from "./logger.js";
 import { config } from "./config.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 import { repoPath } from "./repo-root.js";
+import { logClose as researchLogClose } from "./stop-research.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 
@@ -145,6 +146,19 @@ export async function recordPerformance(perf) {
   };
 
   data.performance.push(entry);
+
+  // Stop-research: record final outcome (joins TICK/TRIGGER by position_id).
+  // Pure observation — never throws into the close path.
+  researchLogClose({
+    position: perf.position,
+    pool: perf.pool,
+    pair: perf.pool_name,
+    pnl_pct: entry.pnl_pct,
+    pnl_usd: entry.pnl_usd,
+    unclaimed_fees_usd: 0, // fees already collected at close
+    collected_fees_usd: perf.fees_earned_usd,
+    minutes_held: perf.minutes_held,
+  }, perf.close_reason);
 
   // Derive and store a lesson
   const lesson = derivLesson(entry);
