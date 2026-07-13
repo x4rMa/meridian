@@ -71,7 +71,7 @@ function buildSignalSummary(payload) {
   };
 }
 
-export function evaluatePreset(side, preset, payload) {
+export function evaluatePreset(side, preset, payload, interval) {
   const summary = buildSignalSummary(payload);
   const oversold = Number(config.indicators.rsiOversold ?? 30);
   const overbought = Number(config.indicators.rsiOverbought ?? 80);
@@ -212,6 +212,76 @@ export function evaluatePreset(side, preset, payload) {
             reason: "Supertrend bearish confirmation or RSI overbought",
             signal: summary,
           };
+    case "mtf_supertrend": {
+      const iv = String(interval || "").toUpperCase();
+      const isTrendInterval = iv === "15_MINUTE" || iv === "1_HOUR";
+      const isTriggerInterval = iv === "5_MINUTE";
+      const bullishTrend =
+        summary.supertrendBreakUp ||
+        (isBullish && close != null && summary.supertrendValue != null && close >= summary.supertrendValue);
+      const bearishTrend =
+        summary.supertrendBreakDown ||
+        (isBearish && close != null && summary.supertrendValue != null && close <= summary.supertrendValue);
+
+      if (side === "entry") {
+        if (isTrendInterval) {
+          return {
+            confirmed: bullishTrend,
+            reason: bullishTrend
+              ? `${iv} supertrend bullish (trend)`
+              : `${iv} supertrend not bullish (trend)`,
+            signal: summary,
+          };
+        }
+        if (isTriggerInterval) {
+          const triggerBreak = summary.supertrendBreakUp;
+          const triggerStoch = stochRsi != null && stochRsi <= stochOversold;
+          return {
+            confirmed: triggerBreak || triggerStoch,
+            reason: triggerBreak
+              ? "5m supertrend break-up (trigger)"
+              : triggerStoch
+                ? `5m StochRSI ${stochRsi.toFixed(2)} <= ${stochOversold} (trigger)`
+                : `5m no trigger (break=${triggerBreak}, stochRsi=${stochRsi?.toFixed(2) ?? "n/a"})`,
+            signal: summary,
+          };
+        }
+        return {
+          confirmed: false,
+          reason: "mtf_supertrend requires 15_MINUTE (trend) and 5_MINUTE (trigger) intervals",
+          signal: summary,
+        };
+      }
+
+      // exit
+      if (isTrendInterval) {
+        return {
+          confirmed: bearishTrend,
+          reason: bearishTrend
+            ? `${iv} supertrend bearish (trend)`
+            : `${iv} supertrend not bearish (trend)`,
+          signal: summary,
+        };
+      }
+      if (isTriggerInterval) {
+        const triggerBreak = summary.supertrendBreakDown;
+        const triggerStoch = stochRsi != null && stochRsi >= stochOverbought;
+        return {
+          confirmed: triggerBreak || triggerStoch,
+          reason: triggerBreak
+            ? "5m supertrend break-down (trigger)"
+            : triggerStoch
+              ? `5m StochRSI ${stochRsi.toFixed(2)} >= ${stochOverbought} (trigger)`
+              : `5m no trigger (break=${triggerBreak}, stochRsi=${stochRsi?.toFixed(2) ?? "n/a"})`,
+          signal: summary,
+        };
+      }
+      return {
+        confirmed: false,
+        reason: "mtf_supertrend requires 15_MINUTE (trend) and 5_MINUTE (trigger) intervals",
+        signal: summary,
+      };
+    }
     case "bb_plus_rsi":
       return side === "entry"
         ? {
@@ -319,7 +389,7 @@ export async function confirmIndicatorPreset({
   for (const interval of targets) {
     try {
       const payload = await fetchChartIndicatorsForMint(mint, { interval, refresh });
-      const evaluation = evaluatePreset(side, preset, payload);
+      const evaluation = evaluatePreset(side, preset, payload, interval);
       results.push({
         interval,
         ok: true,

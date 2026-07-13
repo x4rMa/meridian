@@ -1553,6 +1553,18 @@ export async function claimFees({ position_address }) {
     const pool = await getPool(poolAddress);
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
+    // Capture the live unclaimed fee amount BEFORE claiming — on-chain it reads
+    // zero after the claim tx lands. recordClaim needs this to bump
+    // total_fees_claimed_usd in state.json (previously called with no amount,
+    // leaving the counter stuck at 0 even though fees were swept).
+    let claimedUsd = null;
+    try {
+      const live = await getMyPositions({ force: true, silent: true });
+      const livePos = live?.positions?.find((p) => p.position === position_address);
+      claimedUsd = livePos?.unclaimed_fees_usd ?? null;
+    } catch (e) {
+      log("claim_warn", `Could not capture pre-claim fee amount: ${e.message}`);
+    }
     const txs = await pool.claimSwapFee({
       owner: wallet.publicKey,
       position: positionData,
@@ -1569,9 +1581,9 @@ export async function claimFees({ position_address }) {
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
-    recordClaim(position_address);
+    recordClaim(position_address, claimedUsd);
 
-    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    return { success: true, position: position_address, txs: txHashes, claimed_amount: claimedUsd, base_mint: pool.lbPair.tokenXMint.toString() };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -1758,6 +1770,11 @@ export async function closePosition({ position_address, reason }) {
             };
           }
         } catch { /* non-blocking */ }
+
+        // Record fees swept during close so total_fees_claimed_usd in state.json
+        // reflects reality (closePosition claims via claimSwapFee + shouldClaimAndClose
+        // but previously never called recordClaim, leaving the counter at 0).
+        if (feesUsd > 0) recordClaim(position_address, feesUsd);
 
         await recordPerformance({
           position: position_address,
@@ -2063,6 +2080,9 @@ export async function closePosition({ position_address, reason }) {
           };
         }
       } catch { /* non-blocking */ }
+
+      // Record fees swept during close (relay branch mirrors this at ~1777).
+      if (feesUsd > 0) recordClaim(position_address, feesUsd);
 
       await recordPerformance({
         position: position_address,
