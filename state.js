@@ -43,6 +43,28 @@ function load() {
       for (const posId in state.positions) {
         const pos = state.positions[posId];
         if (pos && !pos.pool_type) pos.pool_type = "dlmm";
+        // Tri-state migration: backfill state_status + chain_confirmed_closed.
+        // Legacy `closed:true` positions were verified by closePosition's
+        // confirmation loop before recordClose, so they are authoritative.
+        if (pos && pos.state_status == null) {
+          if (pos.closed) {
+            pos.state_status = "closed";
+            pos.chain_confirmed_closed = true;
+          } else {
+            pos.state_status = "open";
+            pos.chain_confirmed_closed = false;
+          }
+          pos.state_status_since = pos.closed_at || pos.deployed_at || new Date().toISOString();
+        }
+        // Monotonicity assertion: state_status=closed without chain confirmation
+        // is corruption. Auto-fix + log so it's visible.
+        if (pos && pos.state_status === "closed" && !pos.chain_confirmed_closed) {
+          log("lifecycle", `lifecycle_fatal: ${posId} state_status=closed but chain_confirmed_closed=false — auto-fixing`);
+          pos.chain_confirmed_closed = true;
+        }
+        if (pos && pos.state_status === "closed" && !pos.closed) {
+          pos.closed = true;
+        }
       }
     }
     return state;
@@ -59,6 +81,42 @@ function save(state) {
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }
+}
+
+/**
+ * A position is "closed for sure" only when chain confirmation landed.
+ * This is the ONE gate that disables risk management. A mere `closed` flag
+ * (possibly stale from a false syncOpenPositions) never suppresses exits.
+ * chain_confirmed_closed is a sticky one-way ratchet: once true, never reset.
+ */
+export function isClosedConfirmed(pos) {
+  return !!(pos && pos.chain_confirmed_closed);
+}
+
+/**
+ * Transition a position's state_status, stamping state_status_since and emitting
+ * a lifecycle log. Monotonic guard: CLOSED→OPEN is forbidden (would indicate
+ * corruption or a resurrected-then-reconfirmed position). `force` bypasses the
+ * guard — used only by an explicit recovery command (none yet exists).
+ */
+function transitionStatus(pos, newStatus, { force = false } = {}) {
+  const prev = pos.state_status;
+  if (prev === newStatus) return false;
+  if (prev === "closed" && newStatus !== "closed" && !force) {
+    log("lifecycle", `lifecycle_fatal: refusing CLOSED→${newStatus} for ${pos.position} (monotonic). Use force=true for explicit recovery.`);
+    return false;
+  }
+  pos.state_status = newStatus;
+  pos.state_status_since = new Date().toISOString();
+  if (newStatus === "closed") {
+    pos.chain_confirmed_closed = true; // sticky ratchet
+    pos.last_chain_confirmation = pos.state_status_since;
+    pos.closed = true;
+  } else {
+    pos.closed = false;
+  }
+  log("lifecycle", `${prev}→${newStatus} ${pos.position?.slice(0, 8)}`);
+  return true;
 }
 
 // ─── Position Registry ─────────────────────────────────────────
@@ -116,6 +174,11 @@ export function trackPosition({
     rebalance_count: 0,
     closed: false,
     closed_at: null,
+    state_status: "open",
+    chain_confirmed_closed: false,
+    state_status_since: new Date().toISOString(),
+    last_chain_confirmation: null,
+    closure_unconfirmed_at: null,
     notes: [],
     peak_pnl_pct: 0,
     pending_peak_pnl_pct: null,
@@ -202,8 +265,8 @@ export function recordClose(position_address, reason) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos) return;
-  pos.closed = true;
   pos.closed_at = new Date().toISOString();
+  transitionStatus(pos, "closed");
   pos.notes.push(`Closed at ${pos.closed_at}: ${reason}`);
   pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
   save(state);
@@ -235,7 +298,7 @@ export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2)
   if (candidatePnlPct == null) return false;
   const state = load();
   const pos = state.positions[position_address];
-  if (!pos || pos.closed) return false;
+  if (!pos || isClosedConfirmed(pos)) return false;
 
   const currentPeak = pos.peak_pnl_pct ?? 0;
   // No new high — drop any pending peak candidate.
@@ -283,7 +346,7 @@ export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2)
 export function registerExitSignal(position_address, signal, confirmTicks = 2) {
   const state = load();
   const pos = state.positions[position_address];
-  if (!pos || pos.closed) return { fire: false, action: null, count: 0 };
+  if (!pos || isClosedConfirmed(pos)) return { fire: false, action: null, count: 0 };
 
   if (!signal) {
     if (pos.pending_exit_action != null) {
@@ -316,6 +379,10 @@ export function registerExitSignal(position_address, signal, confirmTicks = 2) {
 
 /**
  * Get all tracked positions (optionally filter open-only).
+ * "open" here includes UNKNOWN (unconfirmed-closed) positions — they occupy
+ * capital and may still be active on-chain, so they count against capacity and
+ * keep the PnL poller running. Only chain-confirmed CLOSED (closed=true)
+ * positions are excluded.
  */
 export function getTrackedPositions(openOnly = false) {
   const state = load();
@@ -357,6 +424,7 @@ export function getStateSummary() {
       initial_fee_tvl_24h: p.initial_fee_tvl_24h,
       rebalance_count: p.rebalance_count,
       instruction: p.instruction || null,
+      state_status: p.state_status || "open",
     })),
     last_updated: state.lastUpdated,
     recent_events: (state.recentEvents || []).slice(-10),
@@ -375,7 +443,21 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
   const state = load();
   const pos = state.positions[position_address];
-  if (!pos || pos.closed) return null;
+  if (!pos || isClosedConfirmed(pos)) return null;
+
+  // Observability: when exits are evaluated on an UNKNOWN (unconfirmed-closed)
+  // position, surface it once per unknown-status period. This is the exact
+  // scenario that caused the TrumpCoin incident — exits kept being silently
+  // skipped on a stale `closed` flag. With tri-state, UNKNOWN positions are
+  // actively managed; this log confirms that.
+  if (pos.state_status === "unknown" && !pos._exitLoggedForUnknown) {
+    log("lifecycle", `EXIT_EVALUATED_ON_UNKNOWN ${position_address.slice(0, 8)} pnl=${currentPnlPct}%`);
+    pos._exitLoggedForUnknown = true;
+    save(state);
+  } else if (pos.state_status !== "unknown" && pos._exitLoggedForUnknown) {
+    pos._exitLoggedForUnknown = false;
+    save(state);
+  }
 
   let changed = false;
 
@@ -472,31 +554,92 @@ export function setLastBriefingDate() {
 
 /**
  * Reconcile local state with actual on-chain positions.
- * Marks any local open positions as closed if they are not in the on-chain list.
+ *
+ * Tri-state model — SDK absence is NOT closure:
+ *   OPEN    → (SDK missing, grace expired) → UNKNOWN
+ *   UNKNOWN → (getAccountInfo confirms gone) → CLOSED (chain_confirmed_closed=true, sticky)
+ *   UNKNOWN → (getAccountInfo still exists) → OPEN (SDK false negative, recovered)
+ *
+ * `confirmClosed(positionAddress)` is an async callback (supplied by dlmm.js, which
+ * owns the Solana connection) returning true if the position account is gone on-chain.
+ * state.js stays free of web3.js. If the callback throws or RPC fails, it must return
+ * false — we never confirm-closed on an RPC error (would risk a false closure).
+ *
+ * If the account still exists → OPEN (SDK blip). log CLOSE_CONFIRMATION_FAILED so SDK
+ * indexing lag is directly measurable.
  */
-const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
+const SYNC_GRACE_MS = 5 * 60_000; // don't even go UNKNOWN for positions deployed < 5 min ago
 
-export function syncOpenPositions(active_addresses) {
+export async function syncOpenPositions(active_addresses, confirmClosed) {
   const state = load();
   const activeSet = new Set(active_addresses);
   let changed = false;
 
   for (const posId in state.positions) {
     const pos = state.positions[posId];
-    if (pos.closed || activeSet.has(posId)) continue;
-
-    // Grace period: newly deployed positions may not be indexed yet
-    const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
-    if (Date.now() - deployedAt < SYNC_GRACE_MS) {
-      log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
+    // Chain-confirmed closed → done forever (monotonic).
+    if (isClosedConfirmed(pos)) continue;
+    // Seen by SDK this cycle → (re)confirm OPEN, clear any pending unknown.
+    if (activeSet.has(posId)) {
+      if (pos.state_status === "unknown") {
+        transitionStatus(pos, "open");
+        pos.closure_unconfirmed_at = null;
+        changed = true;
+      }
       continue;
     }
 
-    pos.closed = true;
-    pos.closed_at = new Date().toISOString();
-    pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
-    changed = true;
-    log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
+    // Grace period: newly deployed positions may not be indexed yet.
+    const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
+    if (Date.now() - deployedAt < SYNC_GRACE_MS) {
+      log("state", `Position ${posId} not on-chain yet — within grace period, skipping`);
+      continue;
+    }
+
+    // SDK didn't return it.
+    if (pos.state_status === "open") {
+      // First miss → UNKNOWN. Do NOT touch closed/chain_confirmed_closed.
+      transitionStatus(pos, "unknown");
+      pos.closure_unconfirmed_at = new Date().toISOString();
+      changed = true;
+      log("state", `Position ${posId} → UNKNOWN (SDK missing, grace expired)`);
+      continue;
+    }
+
+    if (pos.state_status === "unknown") {
+      // Second+ miss → confirm against chain before closing.
+      let confirmed = false;
+      if (typeof confirmClosed === "function") {
+        try {
+          confirmed = await confirmClosed(posId);
+        } catch (e) {
+          log("state", `confirmClosed RPC failed for ${posId}: ${e.message} — staying UNKNOWN`);
+          confirmed = false;
+        }
+      }
+      if (confirmed) {
+        pos.closed_at = new Date().toISOString();
+        const dur = pos.closure_unconfirmed_at
+          ? Date.now() - new Date(pos.closure_unconfirmed_at).getTime()
+          : null;
+        transitionStatus(pos, "closed");
+        pos.closure_unconfirmed_at = null;
+        pos.notes.push(`Closed at ${pos.closed_at}: confirmed missing on-chain (getAccountInfo)`);
+        changed = true;
+        log("lifecycle", `UNKNOWN→CLOSED ${posId.slice(0, 8)} (confirmed via getAccountInfo)${dur != null ? ` UNKNOWN_DURATION_MS=${dur}` : ""}`);
+      } else {
+        // Account still exists → SDK false negative. Recover to OPEN.
+        const dur = pos.closure_unconfirmed_at
+          ? Date.now() - new Date(pos.closure_unconfirmed_at).getTime()
+          : null;
+        transitionStatus(pos, "open");
+        pos.closure_unconfirmed_at = null;
+        changed = true;
+        log("lifecycle", `UNKNOWN→OPEN ${posId.slice(0, 8)} (recovered — account still on-chain)${dur != null ? ` UNKNOWN_DURATION_MS=${dur}` : ""}`);
+        log("lifecycle", `CLOSE_CONFIRMATION_FAILED ${posId.slice(0, 8)} (SDK false negative — account exists but SDK missed it)`);
+      }
+      continue;
+    }
   }
 
   if (changed) save(state);

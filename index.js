@@ -1,6 +1,7 @@
 import "./envcrypt.js";
 import cron from "node-cron";
 import readline from "readline";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
@@ -37,14 +38,75 @@ import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
 
-import { REPO_ROOT, repoPath } from "./repo-root.js";
+import { REPO_ROOT, DATA_ROOT, repoPath } from "./repo-root.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const indexPath = fileURLToPath(import.meta.url);
 const isMain = process.env.pm_id != null
   || (entrypointPath ? path.resolve(entrypointPath) === indexPath : false);
 
+// ─── Single-instance PID lockfile ──────────────────────────────────
+// Prevents two daemon processes from running against the same DATA_ROOT
+// (which caused the 2026-07-14 incident: every cron cycle fired twice).
+// The lock lives in DATA_ROOT so different MERIDIAN_HOME wallets run
+// concurrently without interfering. Atomic create via 'wx'; stale PIDs
+// (dead process) are reclaimed. Lockfile content is JSON for debuggability.
+let _pidLockPath = null;
+function _writeLockMeta(lockPath) {
+  const meta = JSON.stringify({
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+    version: process.env.npm_package_version || "unknown",
+  });
+  const fd = fs.openSync(lockPath, "wx");
+  fs.writeFileSync(fd, meta);
+  fs.closeSync(fd);
+}
+function acquirePidLock(lockPath) {
+  const tryAcquire = () => {
+    try { _writeLockMeta(lockPath); return true; }
+    catch (e) { if (e.code !== "EEXIST") throw e; return false; }
+  };
+  if (tryAcquire()) { _pidLockPath = lockPath; return true; }
+  // Lock exists — inspect the holder.
+  let held = null;
+  try { held = JSON.parse(fs.readFileSync(lockPath, "utf8")); }
+  catch (e) {
+    // Corrupt/unreadable — overwrite it.
+    log("startup", `Overwriting unreadable lockfile at ${lockPath}: ${e.message}`);
+    try { fs.unlinkSync(lockPath); } catch {}
+    if (tryAcquire()) { _pidLockPath = lockPath; return true; }
+    return false;
+  }
+  const heldPid = held?.pid;
+  if (heldPid) {
+    try {
+      process.kill(heldPid, 0); // throws if process is dead / no permission
+      // Holder is alive — refuse to start.
+      log("fatal", `Another daemon (PID ${heldPid}, started ${held.started_at || "?"}) already holds the lock at ${lockPath}. Exiting.`);
+      return false;
+    } catch {
+      // Holder is dead — reclaim the stale lock.
+      log("startup", `Reclaiming stale lock (PID ${heldPid} no longer alive) at ${lockPath}`);
+      fs.unlinkSync(lockPath);
+      if (tryAcquire()) { _pidLockPath = lockPath; return true; }
+    }
+  }
+  return false;
+}
+
+function releasePidLock() {
+  if (!_pidLockPath) return;
+  try { fs.unlinkSync(_pidLockPath); } catch { /* already gone */ }
+  _pidLockPath = null;
+}
+
 if (isMain) {
+  const _lockFile = path.join(DATA_ROOT, ".meridian.lock");
+  if (!acquirePidLock(_lockFile)) {
+    log("fatal", `Could not acquire daemon lock at ${_lockFile}. Another instance is running in this data dir (${DATA_ROOT}).`);
+    process.exit(1);
+  }
   log("startup", "DLMM LP Agent starting...");
   log("startup", `Repo: ${REPO_ROOT} | cwd: ${process.cwd()}${process.env.pm_id ? ` | PM2 id: ${process.env.pm_id}` : ""}`);
   if (path.resolve(process.cwd()) !== path.resolve(REPO_ROOT)) {
@@ -904,6 +966,7 @@ async function shutdown(signal) {
   } else {
     log("shutdown", "Open position snapshot skipped during shutdown timeout");
   }
+  releasePidLock();
   process.exit(0);
 }
 
@@ -2100,8 +2163,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
           console.log(`\nNeed at least 5 closed positions to evolve. ${needed} more needed.\n`);
           return;
         }
-        const fs = await import("fs");
-        const lessonsData = JSON.parse(fs.default.readFileSync(repoPath("lessons.json"), "utf8"));
+        const lessonsData = JSON.parse(fs.readFileSync(repoPath("lessons.json"), "utf8"));
         const result = evolveThresholds(lessonsData.performance, config);
         if (!result || Object.keys(result.changes).length === 0) {
           console.log("\nNo threshold changes needed — current settings already match performance data.\n");

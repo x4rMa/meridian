@@ -36,6 +36,7 @@ import {
   markOutOfRange,
   minutesOutOfRange,
   getTrackedPosition,
+  isClosedConfirmed,
   trackPosition,
   recordClose,
   recordClaim,
@@ -816,7 +817,7 @@ export async function claimDammFees({ position_address }) {
   }
 
   const tracked = getTrackedPosition(positionAddress);
-  if (tracked?.closed) {
+  if (isClosedConfirmed(tracked)) {
     return { success: false, error: "Position is already closed — nothing to claim." };
   }
 

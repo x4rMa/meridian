@@ -26,6 +26,7 @@ import {
   recordClaim,
   recordClose,
   getTrackedPosition,
+  isClosedConfirmed,
   minutesOutOfRange,
   syncOpenPositions,
 } from "../state.js";
@@ -92,6 +93,29 @@ function getConnection() {
     _connection = new Connection(process.env.RPC_URL, "confirmed");
   }
   return _connection;
+}
+
+// Meteora DLMM program id — used to confirm a position account is still owned
+// by the program (i.e. genuinely open). Reused by getProgramAccounts scans.
+const DLMM_PROGRAM_ID = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+
+/**
+ * On-chain confirmation that a position is truly closed: the position account
+ * is either gone or no longer owned by the DLMM program. This is the ONLY
+ * authority for transitioning a position UNKNOWN → CLOSED in syncOpenPositions.
+ * Never throws — on RPC error returns false (we never confirm-closed on a
+ * network failure, which would risk a false closure of a live position).
+ */
+async function confirmPositionClosedOnChain(positionAddress) {
+  try {
+    const info = await getConnection().getAccountInfo(new PublicKey(positionAddress), "confirmed");
+    // Account gone → closed. Account present but not owned by DLMM → drained/closed.
+    if (!info) return true;
+    return !info.owner.equals(DLMM_PROGRAM_ID);
+  } catch (e) {
+    log("positions_warn", `confirmPositionClosedOnChain RPC failed for ${positionAddress.slice(0, 8)}: ${e.message} — treating as NOT closed`);
+    return false;
+  }
 }
 
 function getWallet() {
@@ -1220,7 +1244,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           rpcResult.total_positions = rpcResult.positions.length;
         }
         if (useLocalWallet) {
-          syncOpenPositions(rpcResult.positions.map((p) => p.position));
+          await syncOpenPositions(rpcResult.positions.map((p) => p.position), confirmPositionClosedOnChain);
           _positionsCache = rpcResult;
           _positionsCacheAt = Date.now();
         }
@@ -1398,7 +1422,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       result.total_positions = result.positions.length;
     }
     if (useLocalWallet) {
-      syncOpenPositions(result.positions.map(p => p.position));
+      await syncOpenPositions(result.positions.map(p => p.position), confirmPositionClosedOnChain);
       _positionsCache = result;
       _positionsCacheAt = Date.now();
     }
@@ -1422,9 +1446,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
 // ─── Get Positions for Any Wallet ─────────────────────────────
 export async function getWalletPositions({ wallet_address }) {
   try {
-    const DLMM_PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
-
-    const accounts = await getConnection().getProgramAccounts(DLMM_PROGRAM, {
+    const accounts = await getConnection().getProgramAccounts(DLMM_PROGRAM_ID, {
       filters: [{ memcmp: { offset: 40, bytes: new PublicKey(wallet_address).toBase58() } }],
     });
 
@@ -1540,7 +1562,7 @@ export async function claimFees({ position_address }) {
   }
 
   const tracked = getTrackedPosition(position_address);
-  if (tracked?.closed) {
+  if (isClosedConfirmed(tracked)) {
     return { success: false, error: "Position already closed — fees were claimed during close" };
   }
 

@@ -47,3 +47,6 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# Meridian daemon single-instance lock (runtime, per DATA_ROOT)
+.meridian.lock
