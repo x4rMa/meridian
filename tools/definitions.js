@@ -192,6 +192,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
             description: "Which AMM. Defaults to dlmm. The screener tags each candidate with its pool_type — pass it through. For damm_v2 there are no bins; downside_pct/upside_pct are pool-selection bounds (the screener + safety rail have already verified the pool's fixed range), and only amount_y (single-side SOL) is supported."
           },
           tier: { type: "string", enum: ["degen", "midcap"], description: "Screening tier that admitted this candidate. Pass it through from the candidate block so the deploy safety check uses the correct bin_step range." },
+          age_band: { type: "string", description: "Age band that admitted this candidate (from the candidate block's age_band field, e.g. \"fresh\" or \"mature\"). Pass it through so the deploy safety check applies that band's threshold overrides — otherwise a band-relaxed gate (e.g. lower organic for mature pools) gets re-validated at the stricter base level and blocks the deploy." },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
           bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
           base_fee: { type: "number", description: "Pool base fee percentage (from discover_pools)" },

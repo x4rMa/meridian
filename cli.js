@@ -208,6 +208,25 @@ Shows all closed position performance history with summary stats.
 Output: { summary: { total_positions_closed, total_pnl_usd, avg_pnl_pct, win_rate_pct, total_lessons }, count, positions: [...] }
 \`\`\`
 
+### meridian analyze-performance --bucket <field> [--bins <edges>] [--metric <m>] [--min-trades <n>]
+Generic performance analytics: buckets all closed positions by any persisted field
+and prints per-bucket ROI / win-rate / rug-rate stats. Field may be a top-level key
+(pnl_pct, entry_mcap, volatility, minutes_held, close_reason) or a signal_snapshot
+key (fee_tvl_ratio, organic_score, token_age_hours, age_band, holder_count, volume).
+Dotted paths (signal_snapshot.fee_tvl_ratio) are accepted; bare names auto-fall-back
+to signal_snapshot.<name> if the top-level key is absent.
+
+--bins accepts comma-separated numeric edges, e.g. \`--bins 0,72,168,720,1440,100000\`.
+A trailing \`+\` on the last edge makes it an open upper bucket (e.g. \`1440+\`).
+For non-numeric (categorical) fields like close_reason or age_band, omit --bins;
+each distinct value becomes its own bucket.
+
+--metric selects the aggregate to display per bucket (default: pnl_pct).
+\`\`\`
+Output: a table of { bucket, trades, avg_roi, median_roi, win_pct, rug_pct, avg_fees, max_dd } + the raw rows.
+\`\`\`
+Example: \`meridian analyze-performance --bucket token_age_hours --bins 0,72,168,720,1440+\`
+
 ### meridian discord-signals [clear]
 Shows pending Discord signal queue from the discord-listener process.
 \`\`\`
@@ -261,6 +280,10 @@ const { values: flags } = parseArgs({
     "dry-run":    { type: "boolean" },
     "silent":     { type: "boolean" },
     limit:        { type: "string" },
+    bucket:       { type: "string" },
+    bins:         { type: "string" },
+    metric:       { type: "string" },
+    "min-trades": { type: "string" },
   },
   allowPositionals: true,
   strict: false,
@@ -607,6 +630,157 @@ switch (subcommand) {
     const history = getPerformanceHistory({ hours: 999999, limit });
     const summary = getPerformanceSummary();
     out({ summary, ...history });
+    break;
+  }
+
+  // ── analyze-performance ─────────────────────────────────────────
+  // Generic performance analytics: bucket historical trades by any persisted
+  // field and print per-bucket ROI / win-rate / rug-rate stats. Built to
+  // validate/refute the "rug danger zone" hypothesis with real data, but
+  // field-agnostic — works for entry_mcap, fee_tvl_ratio, holder_count, etc.
+  case "analyze-performance": {
+    const bucket = flags.bucket;
+    if (!bucket) die("Usage: meridian analyze-performance --bucket <field> [--bins <edges>] [--metric pnl_pct] [--min-trades 3]\n  Example: meridian analyze-performance --bucket token_age_hours --bins 0,72,168,720,1440+");
+    const { getAllPerformance } = await import("./lessons.js");
+    const rows = getAllPerformance();
+    if (!rows.length) { out({ message: "No closed positions recorded yet.", buckets: [] }); break; }
+
+    const metric = flags.metric || "pnl_pct";
+    const minTrades = flags["min-trades"] ? parseInt(flags["min-trades"]) : 1;
+
+    // Resolve a (possibly dotted) field from a row. Bare names fall back to
+    // signal_snapshot.<name> if the top-level key is absent — so "fee_tvl_ratio"
+    // works without the caller knowing it lives in signal_snapshot.
+    function resolveField(row, field) {
+      if (field.includes(".")) {
+        return field.split(".").reduce((o, k) => (o == null ? o : o[k]), row);
+      }
+      if (row[field] !== undefined) return row[field];
+      return row?.signal_snapshot?.[field];
+    }
+
+    const rawValues = rows.map((r) => resolveField(r, bucket));
+    const allNumeric = rawValues.every((v) => v == null || typeof v === "number" || typeof v === "bigint");
+
+    // Build bucket key per row.
+    let binEdges = null;
+    let openUpper = false;
+    if (flags.bins) {
+      const parts = flags.bins.split(",").map((s) => s.trim()).filter(Boolean);
+      // trailing "+" → open upper bucket
+      const last = parts[parts.length - 1];
+      if (last.endsWith("+")) { openUpper = true; parts[parts.length - 1] = last.slice(0, -1); }
+      binEdges = parts.map((s) => Number(s)).filter((n) => Number.isFinite(n));
+      if (binEdges.length < 1) die(`--bins "${flags.bins}" parsed to no numeric edges`);
+      binEdges.sort((a, b) => a - b);
+    }
+
+    function bucketLabelFor(value) {
+      if (value == null) return "unknown";
+      if (binEdges == null) {
+        // categorical
+        return String(value);
+      }
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "non-numeric";
+      for (let i = 0; i < binEdges.length; i++) {
+        const lo = binEdges[i];
+        const hi = (i + 1 < binEdges.length) ? binEdges[i + 1] : (openUpper ? Infinity : null);
+        if (hi == null) {
+          // single edge, no open-upper: bucket is ">= edge"
+          if (n >= lo) return `>=${lo}`;
+        } else if (n >= lo && n < hi) {
+          return `${lo}-${hi}`;
+        }
+      }
+      // Above the last finite edge with openUpper off → ">= last"
+      if (!openUpper && n >= binEdges[binEdges.length - 1]) return `>=${binEdges[binEdges.length - 1]}`;
+      return `>=${binEdges[binEdges.length - 1]}`;
+    }
+
+    // Group rows by bucket.
+    const groups = new Map();
+    for (const r of rows) {
+      const v = resolveField(r, bucket);
+      const label = bucketLabelFor(v);
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push(r);
+    }
+
+    // Order buckets: numeric bins in ascending edge order, then "unknown"/"non-numeric" last.
+    function bucketOrder(a, b) {
+      const rank = (lbl) => {
+        if (lbl === "unknown") return 1e9;
+        if (lbl === "non-numeric") return 1e9 + 1;
+        const m = lbl.match(/^(\d+(?:\.\d+)?)/);
+        return m ? Number(m[1]) : 1e8;
+      };
+      return rank(a) - rank(b);
+    }
+
+    const RUG_REASONS = new Set(["stop loss", "stoploss", "emergency", "rug", "abandoned", "dump"]);
+    function isRug(closeReason) {
+      const c = String(closeReason || "").toLowerCase();
+      return RUG_REASONS.has(c) || c.includes("stop loss") || c.includes("rug");
+    }
+
+    const buckets = [...groups.entries()].sort((a, b) => bucketOrder(a[0], b[0])).map(([label, groupRows]) => {
+      const trades = groupRows.length;
+      const metrics = groupRows.map((r) => Number(resolveField(r, metric))).filter((n) => Number.isFinite(n));
+      const pnls = groupRows.map((r) => Number(r.pnl_pct)).filter((n) => Number.isFinite(n));
+      const fees = groupRows.map((r) => Number(r.fees_earned_usd)).filter((n) => Number.isFinite(n));
+      const maxDDs = groupRows.map((r) => {
+        // max drawdown proxy: worst pnl_pct observed (most negative). If a real
+        // max_drawdown field is ever recorded, prefer it.
+        const p = Number(r.pnl_pct);
+        return Number.isFinite(p) ? Math.min(0, p) : null;
+      }).filter((n) => n != null);
+      const sorted = [...metrics].sort((a, b) => a - b);
+      const median = sorted.length ? (sorted.length % 2 ? sorted[(sorted.length - 1) >> 1] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2) : null;
+      const wins = pnls.filter((p) => p > 0).length;
+      const rugs = groupRows.filter((r) => isRug(r.close_reason)).length;
+      const avg = (arr) => arr.length ? arr.reduce((s, n) => s + n, 0) / arr.length : null;
+      return {
+        bucket: label,
+        trades,
+        avg_roi: avg(metrics) != null ? Math.round(avg(metrics) * 100) / 100 : null,
+        median_roi: median != null ? Math.round(median * 100) / 100 : null,
+        win_pct: pnls.length ? Math.round((wins / pnls.length) * 100) : null,
+        rug_pct: trades ? Math.round((rugs / trades) * 100) : null,
+        avg_fees_usd: avg(fees) != null ? Math.round(avg(fees) * 1000) / 1000 : null,
+        max_dd_pct: maxDDs.length ? Math.round(Math.min(...maxDDs) * 100) / 100 : null,
+      };
+    });
+
+    // Filter buckets below min-trades (kept but flagged if trades < min).
+    const report = {
+      bucket_field: bucket,
+      metric,
+      bins: binEdges,
+      open_upper: openUpper,
+      categorical: !allNumeric || binEdges == null,
+      total_trades: rows.length,
+      buckets: buckets.filter((b) => b.trades >= minTrades),
+      buckets_below_min: buckets.filter((b) => b.trades < minTrades).map((b) => ({ bucket: b.bucket, trades: b.trades })),
+    };
+
+    // Pretty-print the table to stderr for quick reading; full JSON to stdout (out()).
+    const header = ["bucket", "trades", "avg_roi", "median_roi", "win_pct", "rug_pct", "avg_fees", "max_dd"];
+    const fmt = (v, w) => String(v == null ? "-" : v).padEnd(w).slice(0, w);
+    console.error(`\nanalyze-performance — bucket=${bucket} metric=${metric} (n=${rows.length})`);
+    console.error(header.map((h, i) => fmt(h, [16, 7, 9, 11, 8, 8, 11, 9][i])).join("  "));
+    console.error("-".repeat(88));
+    for (const b of report.buckets) {
+      console.error([
+        fmt(b.bucket, 16), fmt(b.trades, 7), fmt(b.avg_roi, 9), fmt(b.median_roi, 11),
+        fmt(b.win_pct != null ? b.win_pct + "%" : "-", 8), fmt(b.rug_pct != null ? b.rug_pct + "%" : "-", 8),
+        fmt(b.avg_fees_usd, 11), fmt(b.max_dd_pct, 9),
+      ].join("  "));
+    }
+    if (report.buckets_below_min.length) {
+      console.error(`\nbuckets below min-trades (${minTrades}): ${report.buckets_below_min.map((b) => `${b.bucket}(${b.trades})`).join(", ")}`);
+    }
+    out(report);
     break;
   }
 

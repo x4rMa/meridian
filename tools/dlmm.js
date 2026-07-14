@@ -503,6 +503,13 @@ export async function deployPosition({
   entry_tvl,
   entry_volume,
   entry_holders,
+  // Age instrumentation (injected by executor safety checks + LLM). Persisted
+  // into signal_snapshot so historical trades are attributable to the age band
+  // and entry-age bucket that admitted them.
+  token_age_hours,
+  age_band,
+  screening_profile,
+  tier,
   pool_type = "dlmm",
 }) {
   pool_address = normalizeMint(pool_address);
@@ -733,9 +740,16 @@ export async function deployPosition({
 
       const positionAddress = matching?.position || null;
       if (positionAddress) {
-        const signalSnapshot = config.darwin?.enabled
+        const staged = config.darwin?.enabled
           ? getAndClearStagedSignals(pool_address, baseMint)
           : null;
+        const signalSnapshot = {
+          ...(staged || {}),
+          token_age_hours: token_age_hours ?? null,
+          age_band: age_band ?? null,
+          screening_profile: screening_profile ?? null,
+          tier: tier ?? null,
+        };
         trackPosition({
           position: positionAddress,
           pool: pool_address,
@@ -875,9 +889,16 @@ export async function deployPosition({
     log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
 
     _positionsCacheAt = 0;
-    const signalSnapshot = config.darwin?.enabled
+    const staged = config.darwin?.enabled
       ? getAndClearStagedSignals(pool_address, baseMint)
       : null;
+    const signalSnapshot = {
+      ...(staged || {}),
+      token_age_hours: token_age_hours ?? null,
+      age_band: age_band ?? null,
+      screening_profile: screening_profile ?? null,
+      tier: tier ?? null,
+    };
     trackPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
@@ -1078,6 +1099,15 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "study_win_rate",
   "hive_consensus",
   "volatility",
+  "entry_mcap",
+  "entry_tvl",
+  "entry_volume",
+  // Age instrumentation — persisted so historical trades can be bucketed by
+  // entry-age and attributed to the screening profile that admitted them.
+  "token_age_hours",
+  "age_band",
+  "screening_profile",
+  "tier",
 ];
 
 function resolvePerformanceSignalSnapshot({ poolAddress, baseMint, tracked }) {

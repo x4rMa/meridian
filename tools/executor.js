@@ -21,7 +21,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, normalizeTokenAgeBands } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import { execSync, spawn } from "child_process";
@@ -68,35 +68,53 @@ function poolDetailBinStep(pool) {
  * allowed narrower bin_steps (40-150) than degen (80-125). The tier is passed
  * through from the candidate block via the deploy_position.tier arg.
  */
-function binStepBoundsForTier(tier) {
+function binStepBoundsForTier(tier, ageBand) {
   const s = config.screening;
+  const bt = bandThresholdsFor(ageBand);
   if (tier === "midcap") {
     return {
-      min: numberOrNull(s.midcapMinBinStep) ?? numberOrNull(s.minBinStep) ?? 80,
-      max: numberOrNull(s.midcapMaxBinStep) ?? numberOrNull(s.maxBinStep) ?? 125,
+      min: numberOrNull(s.midcapMinBinStep) ?? numberOrNull(bt.minBinStep) ?? numberOrNull(s.minBinStep) ?? 80,
+      max: numberOrNull(s.midcapMaxBinStep) ?? numberOrNull(bt.maxBinStep) ?? numberOrNull(s.maxBinStep) ?? 125,
     };
   }
   return {
-    min: numberOrNull(s.minBinStep) ?? 80,
-    max: numberOrNull(s.maxBinStep) ?? 125,
+    min: numberOrNull(bt.minBinStep) ?? numberOrNull(s.minBinStep) ?? 80,
+    max: numberOrNull(bt.maxBinStep) ?? numberOrNull(s.maxBinStep) ?? 125,
   };
+}
+
+/**
+ * Resolve the threshold overrides for the age band that admitted this candidate
+ * (if any). Mirrors the screening pipeline's band merge: a band's `thresholds`
+ * shallow-merge over the base screening config for that band's evaluation only.
+ * Returns {} when no band matches, so callers can spread safely.
+ */
+function bandThresholdsFor(ageBand) {
+  if (!ageBand) return {};
+  const bands = config.screening.tokenAgeBands;
+  if (!Array.isArray(bands) || bands.length === 0) return {};
+  const band = bands.find((b) => b.name === ageBand);
+  return (band?.thresholds && typeof band.thresholds === "object") ? band.thresholds : {};
 }
 
 /**
  * Tier-aware TVL bounds. Midcap candidates are established pools with higher
  * TVL (up to midcapMaxTvl, default 1m) than the degen envelope (maxTvl, default 250k).
+ * Age-band threshold overrides (e.g. a mature band raising minTvl) take precedence
+ * over the base/tier value when set.
  */
-function tvlBoundsForTier(tier) {
+function tvlBoundsForTier(tier, ageBand) {
   const s = config.screening;
+  const bt = bandThresholdsFor(ageBand);
   if (tier === "midcap") {
     return {
-      min: numberOrNull(s.midcapMinTvl) ?? numberOrNull(s.minTvl) ?? 20000,
-      max: numberOrNull(s.midcapMaxTvl) ?? numberOrNull(s.maxTvl) ?? 250000,
+      min: numberOrNull(s.midcapMinTvl) ?? numberOrNull(bt.minTvl) ?? numberOrNull(s.minTvl) ?? 20000,
+      max: numberOrNull(s.midcapMaxTvl) ?? numberOrNull(bt.maxTvl) ?? numberOrNull(s.maxTvl) ?? 250000,
     };
   }
   return {
-    min: numberOrNull(s.minTvl) ?? 20000,
-    max: numberOrNull(s.maxTvl) ?? 250000,
+    min: numberOrNull(bt.minTvl) ?? numberOrNull(s.minTvl) ?? 20000,
+    max: numberOrNull(bt.maxTvl) ?? numberOrNull(s.maxTvl) ?? 250000,
   };
 }
 
@@ -106,26 +124,30 @@ function tvlBoundsForTier(tier) {
  * - Midcap: ratio OR absolute 24h-fee floor. Fetches the real 24h fee from the
  *   pool discovery API so the absolute floor is judged accurately (a 5m slice
  *   extrapolation undercounts by 4-5×).
+ * Age-band overrides apply on top: a band's minFeeActiveTvlRatio / minFee24hUsd
+ * take precedence, so a band-relaxed fee gate isn't re-validated at the stricter
+ * base level and block the deploy.
  */
-async function checkDeployFeeGate(detail, tier) {
+async function checkDeployFeeGate(detail, tier, ageBand) {
   const s = config.screening;
+  const bt = bandThresholdsFor(ageBand);
   const ratio = numberOrNull(detail?.fee_active_tvl_ratio);
 
   if (tier !== "midcap") {
-    const minRatio = numberOrNull(s.minFeeActiveTvlRatio);
+    const minRatio = numberOrNull(bt.minFeeActiveTvlRatio) ?? numberOrNull(s.minFeeActiveTvlRatio);
     if (minRatio != null && minRatio > 0 && (ratio == null || ratio < minRatio)) {
-      return { pass: false, reason: `Pool fee/active-TVL ${ratio ?? "unknown"} is below configured minFeeActiveTvlRatio ${minRatio} (tier: degen).` };
+      return { pass: false, reason: `Pool fee/active-TVL ${ratio ?? "unknown"} is below configured minFeeActiveTvlRatio ${minRatio} (tier: degen${ageBand ? `, band: ${ageBand}` : ""}).` };
     }
     return { pass: true };
   }
 
   // Midcap: OR-gate.
-  const minRatio = numberOrNull(s.midcapMinFeeActiveTvlRatio) ?? numberOrNull(s.minFeeActiveTvlRatio);
+  const minRatio = numberOrNull(s.midcapMinFeeActiveTvlRatio) ?? numberOrNull(bt.minFeeActiveTvlRatio) ?? numberOrNull(s.minFeeActiveTvlRatio);
   if (minRatio != null && ratio != null && ratio >= minRatio) {
     return { pass: true };
   }
   // Ratio failed — check the absolute 24h fee floor with the real 24h fee.
-  const minFee24hUsd = numberOrNull(s.midcapMinFee24hUsd);
+  const minFee24hUsd = numberOrNull(s.midcapMinFee24hUsd) ?? numberOrNull(bt.minFee24hUsd);
   if (minFee24hUsd != null && minFee24hUsd > 0) {
     let fee24h = numberOrNull(detail?.fee_24h);
     if (!fee24h || fee24h <= 0) {
@@ -231,7 +253,7 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const tvl = poolDetailTvl(detail);
-  const tvlBounds = tvlBoundsForTier(args.tier);
+  const tvlBounds = tvlBoundsForTier(args.tier, args.age_band);
   if (tvl == null) {
     return {
       pass: false,
@@ -252,7 +274,7 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
-  const feeGate = await checkDeployFeeGate(detail, args.tier);
+  const feeGate = await checkDeployFeeGate(detail, args.tier, args.age_band);
   if (!feeGate.pass) {
     return {
       pass: false,
@@ -305,7 +327,7 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const actualBinStep = poolDetailBinStep(detail);
-  const bounds = binStepBoundsForTier(args.tier);
+  const bounds = binStepBoundsForTier(args.tier, args.age_band);
   if (actualBinStep != null && bounds.min != null && actualBinStep < bounds.min) {
     return {
       pass: false,
@@ -320,11 +342,16 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
+  const createdAt = numberOrNull(detail?.token_x?.created_at);
   const entryMarketData = {
     entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
     entry_tvl: tvl,
     entry_volume: numberOrNull(detail?.volume),
     entry_holders: numberOrNull(detail?.base_token_holders ?? detail?.token_x?.holders),
+    // Token age at entry (hours). Persisted into signal_snapshot so historical
+    // trades can be bucketed by entry-age — the basis for validating/refuting
+    // the "rug danger zone" hypothesis with real data.
+    token_age_hours: createdAt != null ? Math.max(0, Math.floor((Date.now() - createdAt) / 3_600_000)) : null,
   };
 
   return { pass: true, entryMarketData };
@@ -378,6 +405,7 @@ function normalizeConfigValue(key, value) {
     "markovEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals"]);
+  const jsonObjectKeys = new Set(["tokenAgeBands"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -403,6 +431,16 @@ function normalizeConfigValue(key, value) {
     "gmgnTrendingOrderBy",
   ]);
   if (value === null) return null;
+  if (jsonObjectKeys.has(key)) {
+    // tokenAgeBands: accept a parsed array/object or a JSON string. Return as-is
+    // (config.js normalizes it on load/reload); reject non-array/non-object input.
+    if (Array.isArray(value)) return value;
+    if (typeof value === "string") {
+      try { return JSON.parse(value); }
+      catch { throw new Error(`${key} must be valid JSON`); }
+    }
+    throw new Error(`${key} must be an array of band objects or a JSON string`);
+  }
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
   if (arrayKeys.has(key)) return coerceStringArray(value, key);
   if (stringKeys.has(key)) return coerceString(value, key);
@@ -535,6 +573,7 @@ const toolMap = {
       blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
+      tokenAgeBands: ["screening", "tokenAgeBands"],
       minDrawdownFromAthPct: ["screening", "minDrawdownFromAthPct"],
       requireVolumeAccelerating: ["screening", "requireVolumeAccelerating"],
       // mid-cap tier (flat keys under screening)
@@ -723,8 +762,12 @@ const toolMap = {
       if (key.startsWith("_")) continue;
       const [section, field] = CONFIG_MAP[key];
       const before = config[section][field];
-      config[section][field] = val;
-      log("config", `update_config: config.${section}.${field} ${before} → ${val} (verify: ${config[section][field]})`);
+      // tokenAgeBands must be normalized (bounds coerced, profile labels
+      // generated) before it reaches the screening filter — raw user input
+      // isn't safe to evaluate directly.
+      const liveVal = key === "tokenAgeBands" ? normalizeTokenAgeBands(val) : val;
+      config[section][field] = liveVal;
+      log("config", `update_config: config.${section}.${field} ${before} → ${liveVal} (verify: ${config[section][field]})`);
     }
     if (
       applied.binsBelow != null ||

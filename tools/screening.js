@@ -257,7 +257,56 @@ export function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   const launchpad = getPoolLaunchpad(pool);
   const createdAt = numeric(base?.created_at);
 
-  // Tier-specific thresholds: midcap overrides the degen envelope; degen uses s.* directly.
+  // ── Age bands ────────────────────────────────────────────────────────────
+  // When tokenAgeBands is configured, a pool passes the age gate iff its token
+  // age falls inside ANY band. The admitting band's `thresholds` shallow-merge
+  // over the base screening config `s` to form the effective config used for
+  // ALL subsequent gates (TVL, organic, fee/TVL, …) — so a "mature" band can
+  // demand higher TVL while relaxing organic, per-regime. Empty bands ⇒ legacy
+  // single min/maxTokenAgeHours gate. The matched band name + screeningProfile
+  // are stamped on the pool so they flow into the deploy signal_snapshot and
+  // attribute historical trades to the policy that selected them.
+  const bands = Array.isArray(s.tokenAgeBands) ? s.tokenAgeBands : [];
+  let ageBandName = null;
+  let ageBandProfile = null;
+  let effectiveS = s;
+  if (bands.length > 0) {
+    const ageHours = createdAt != null
+      ? Math.max(0, (Date.now() - createdAt) / 3_600_000)
+      : null;
+    const admitting = ageHours != null
+      ? bands.find((b) => {
+          const lo = b.minHours != null ? b.minHours : -Infinity;
+          const hi = b.maxHours != null ? b.maxHours : Infinity;
+          return ageHours >= lo && ageHours <= hi;
+        })
+      : null;
+    if (!admitting) {
+      const createdStr = createdAt != null ? `age ${(ageHours ?? 0).toFixed(1)}h` : "created_at unknown";
+      return `token ${createdStr} outside all configured age bands`;
+    }
+    ageBandName = admitting.name;
+    ageBandProfile = admitting.screeningProfile;
+    if (admitting.thresholds && typeof admitting.thresholds === "object") {
+      effectiveS = { ...s, ...admitting.thresholds };
+    }
+    // Stamp on the raw pool so condensePool can surface it to the LLM, and so
+    // the screening cycle can read it when staging the deploy signal snapshot.
+    if (pool && typeof pool === "object") {
+      pool._age_band = ageBandName;
+      pool._screening_profile = ageBandProfile;
+      pool._token_age_hours = ageHours;
+    }
+  } else {
+    // Legacy path: stamp the token age for the deploy signal snapshot even
+    // when bands aren't configured, so instrumentation still captures it.
+    if (pool && typeof pool === "object" && pool._token_age_hours == null) {
+      pool._token_age_hours = createdAt != null
+        ? Math.max(0, (Date.now() - createdAt) / 3_600_000)
+        : null;
+    }
+  }
+  s = effectiveS;
   const isMidcap = tier === "midcap";
   const minMcap        = isMidcap ? (s.midcapMinMcap ?? s.minMcap)            : s.minMcap;
   const maxMcap        = isMidcap ? (s.midcapMaxMcap ?? s.maxMcap)            : s.maxMcap;
@@ -358,13 +407,18 @@ export function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   if (includesCaseInsensitive(s.blockedLaunchpads, launchpad)) {
     return `blocked launchpad (${launchpad})`;
   }
-  if (s.minTokenAgeHours != null) {
-    const maxCreatedAt = Date.now() - s.minTokenAgeHours * 3_600_000;
-    if (createdAt == null || createdAt > maxCreatedAt) return `token age below minTokenAgeHours ${s.minTokenAgeHours}`;
-  }
-  if (maxTokenAgeHours != null) {
-    const minCreatedAt = Date.now() - maxTokenAgeHours * 3_600_000;
-    if (createdAt == null || createdAt < minCreatedAt) return `token age above maxTokenAgeHours ${maxTokenAgeHours}`;
+  // Age gate. When bands are configured, the admitting band was resolved above
+  // (a pool reaching this point already passed). When bands are empty, apply the
+  // legacy single min/maxTokenAgeHours envelope.
+  if (bands.length === 0) {
+    if (s.minTokenAgeHours != null) {
+      const maxCreatedAt = Date.now() - s.minTokenAgeHours * 3_600_000;
+      if (createdAt == null || createdAt > maxCreatedAt) return `token age below minTokenAgeHours ${s.minTokenAgeHours}`;
+    }
+    if (maxTokenAgeHours != null) {
+      const minCreatedAt = Date.now() - maxTokenAgeHours * 3_600_000;
+      if (createdAt == null || createdAt < minCreatedAt) return `token age above maxTokenAgeHours ${maxTokenAgeHours}`;
+    }
   }
   return null;
 }
@@ -1016,11 +1070,18 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     .filter((p) => {
       const tier = p.tier || "degen";
       const isMidcap = tier === "midcap";
-      const tierMinTvl = isMidcap ? (s.midcapMinTvl ?? s.minTvl) : s.minTvl;
-      const tierMaxTvl = isMidcap ? (s.midcapMaxTvl ?? s.maxTvl) : s.maxTvl;
+      // If this pool was admitted by an age band, that band's threshold
+      // overrides apply here too (defense-in-depth re-check on the condensed
+      // pool must use the same per-regime gates as pass one).
+      const admittingBand = p.age_band
+        ? (s.tokenAgeBands || []).find((b) => b.name === p.age_band)
+        : null;
+      const bandThresh = admittingBand?.thresholds || {};
+      const tierMinTvl = isMidcap ? (s.midcapMinTvl ?? bandThresh.minTvl ?? s.minTvl) : (bandThresh.minTvl ?? s.minTvl);
+      const tierMaxTvl = isMidcap ? (s.midcapMaxTvl ?? bandThresh.maxTvl ?? s.maxTvl) : (bandThresh.maxTvl ?? s.maxTvl);
       const tierFeeGateOpts = isMidcap
-        ? { minFeeActiveTvlRatio: s.midcapMinFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, minFee24hUsd: s.midcapMinFee24hUsd }
-        : { minFeeActiveTvlRatio: s.minFeeActiveTvlRatio };
+        ? { minFeeActiveTvlRatio: s.midcapMinFeeActiveTvlRatio ?? bandThresh.minFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, minFee24hUsd: s.midcapMinFee24hUsd ?? bandThresh.minFee24hUsd }
+        : { minFeeActiveTvlRatio: bandThresh.minFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, minFee24hUsd: bandThresh.minFee24hUsd };
       const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
       if (Number.isFinite(tierMinTvl) && tierMinTvl > 0 && tvl < tierMinTvl) {
         pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${tierMinTvl} (${tier})`);
@@ -1226,7 +1287,9 @@ function condensePool(p) {
     organic_score: Math.round(p.token_x?.organic_score || 0),
     token_age_hours: p.token_x?.created_at
       ? Math.floor((Date.now() - p.token_x.created_at) / 3_600_000)
-      : null,
+      : (p._token_age_hours != null ? Math.floor(p._token_age_hours) : null),
+    age_band: p._age_band || null,
+    screening_profile: p._screening_profile || null,
     dev: p.token_x?.dev || null,
     launchpad: getPoolLaunchpad(p),
 

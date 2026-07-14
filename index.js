@@ -634,7 +634,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         : null;
 
       const block = [
-        `POOL: ${pool.name} (${pool.pool}) [tier: ${pool.tier || "degen"}]`,
+        `POOL: ${pool.name} (${pool.pool}) [tier: ${pool.tier || "degen"}${pool.age_band ? `, band: ${pool.age_band}` : ""}]`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, fee_24h=$${pool.fee_24h ?? "?"}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
@@ -668,6 +668,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
           smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
           narrative_quality:     n?.narrative ? "present" : "absent",
           volatility:            pool.volatility            ?? null,
+          token_age_hours:       pool.token_age_hours        ?? null,
+          age_band:              pool.age_band               ?? null,
+          screening_profile:     pool.screening_profile      ?? null,
+          tier:                  pool.tier                   ?? "degen",
         });
       }
 
@@ -693,6 +697,7 @@ STEPS:
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
    pass deploy_position.tier = the candidate's tier (from the [tier: ...] tag in its block) so the bin_step safety check uses the correct range.
+   pass deploy_position.age_band = the candidate's band (from the [band: ...] tag in its block) so the deploy safety check applies that band's threshold overrides.
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
 4. Report in this exact format (one-liners only, no tables, no extra sections):
@@ -1495,6 +1500,8 @@ async function deployLatestCandidate(index) {
     fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
     organic_score: candidate.organic_score,
     initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
+    tier: candidate.tier || "degen",
+    age_band: candidate.age_band || null,
   });
   if (result?.success === false || result?.error) {
     throw new Error(result.error || "Deploy failed");

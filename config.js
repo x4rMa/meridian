@@ -20,6 +20,39 @@ function numericConfig(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Normalize a user-supplied tokenAgeBands array into a stable internal form:
+//   [{ name, minHours, maxHours, thresholds?, screeningProfile }, ...]
+// - drops bands with no usable bounds
+// - coerces numeric bounds, clamps negatives to 0
+// - if the input is not a non-empty array, returns [] (legacy gate takes over)
+// - generates a screeningProfile label per band: "<name>-v1" (or the band's own
+//   `screeningProfile`/`profile` field if supplied). Used to attribute trades.
+// Exported so executor.js can normalize the live config object in-place after
+// an update_config write (the persisted file is re-normalized on next load).
+export function normalizeTokenAgeBands(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  const bands = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const minH = numericConfig(entry.minHours ?? entry.min);
+    const maxH = numericConfig(entry.maxHours ?? entry.max);
+    if (minH == null && maxH == null) continue;
+    const name = String(entry.name || entry.label || "band").trim().slice(0, 32) || "band";
+    const band = {
+      name,
+      minHours: minH != null ? Math.max(0, minH) : null,
+      maxHours: maxH != null ? Math.max(0, maxH) : null,
+    };
+    if (entry.thresholds && typeof entry.thresholds === "object") {
+      band.thresholds = entry.thresholds;
+    }
+    const profile = String(entry.screeningProfile || entry.profile || "").trim();
+    band.screeningProfile = profile || `${name}-v1`;
+    bands.push(band);
+  }
+  return bands;
+}
+
 const legacyBinsBelow = numericConfig(u.binsBelow);
 const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BELOW;
 const configuredMaxBinsBelow = numericConfig(u.maxBinsBelow)
@@ -109,6 +142,15 @@ export const config = {
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    // ─── Token age bands ────────────────────────────────────────────
+    // Arbitrary list of allowed age windows. A pool passes the age gate if its
+    // token age (hours since creation) falls inside ANY band. Bands may carry a
+    // `thresholds` object whose keys shallow-merge over the base screening config
+    // for that band's evaluation only — e.g. a "mature" band can demand higher
+    // TVL while relaxing organic. Empty/null ⇒ legacy single min/maxTokenAgeHours
+    // gate. `screeningProfile` is a stable label stamped on admitted pools so
+    // historical trades remain attributable to the policy that selected them.
+    tokenAgeBands: normalizeTokenAgeBands(u.tokenAgeBands),
     minDrawdownFromAthPct: u.minDrawdownFromAthPct ?? null, // null = disabled. Reject tokens nearer than X% to their 6h-window high (rug risk).
     requireVolumeAccelerating: u.requireVolumeAccelerating ?? false, // require 5m volume run-rate > 1.3× the 1h average
 
@@ -389,6 +431,7 @@ export function reloadScreeningThresholds() {
     if (fresh.category          != null) s.category          = fresh.category;
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
+    if (fresh.tokenAgeBands !== undefined) s.tokenAgeBands = normalizeTokenAgeBands(fresh.tokenAgeBands);
     if (fresh.minDrawdownFromAthPct !== undefined) s.minDrawdownFromAthPct = fresh.minDrawdownFromAthPct;
     if (fresh.requireVolumeAccelerating !== undefined) s.requireVolumeAccelerating = fresh.requireVolumeAccelerating;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;

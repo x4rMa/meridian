@@ -128,6 +128,7 @@ DEPLOY RULES:
 - bins_below = round(config.strategy.minBinsBelow + (candidate volatility/5)*(config.strategy.maxBinsBelow-config.strategy.minBinsBelow)) clamped to [minBinsBelow,maxBinsBelow]. Volatility must be a positive number; 0/unknown means skip.
 - Use amount_y only, keep amount_x=0 and bins_above=0.
 - Bin steps must be [80-125] for degen candidates, [40-150] for midcap candidates. Always pass the candidate's tier through to deploy_position so the safety check applies the correct range.
+- Candidates carry an age band (e.g. [band: fresh] or [band: mature]) — two trading regimes: "fresh" (early discovery, <3 days) and "mature" (survivorship, >60 days). The 3–60 day rug-danger zone is excluded pre-LLM. Always pass the candidate's age_band through to deploy_position so the deploy safety check applies that band's threshold overrides.
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
 
 DAMM v2 DEPLOY RULES (when candidate pool_type === 'damm_v2'):

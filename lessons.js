@@ -32,6 +32,12 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "entry_mcap",
   "entry_tvl",
   "entry_volume",
+  // Age instrumentation — persisted so historical trades can be bucketed by
+  // entry-age and attributed to the screening profile that admitted them.
+  "token_age_hours",
+  "age_band",
+  "screening_profile",
+  "tier",
 ];
 const MAX_MANUAL_LESSON_LENGTH = 400;
 
@@ -772,4 +778,14 @@ export function getPerformanceSummary() {
     win_rate_pct: Math.round((wins / p.length) * 100),
     total_lessons: data.lessons.length,
   };
+}
+
+/**
+ * Return all raw performance entries (full shape, including signal_snapshot).
+ * Used by the `analyze-performance` CLI to bucket historical trades by any
+ * persisted field (token_age_hours, entry_mcap, fee_tvl_ratio, …). The trimmed
+ * getPerformanceHistory deliberately drops signal_snapshot; analytics needs it.
+ */
+export function getAllPerformance() {
+  return load().performance;
 }
