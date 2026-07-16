@@ -124,6 +124,97 @@ async function enrichFee24hForPools(rawPools, s, tier) {
 }
 
 /**
+ * Multi-timeframe volume acceleration — surfaces whether a pool's volume is
+ * accelerating NOW vs. its 24h baseline. Ported from meteora-scanner's
+ * calcGemScore momentum sub-signal. The pool-discovery API returns a scalar
+ * `volume` per timeframe (no nested 1h/4h/12h like dlmm.datapi.meteora.ag),
+ * so this fires one detail call per window per survivor.
+ *
+ * Runs on SURVIVORS of the hard-filter pass only (called from fetchTierPools
+ * after getRawPoolScreeningRejectReason) — 2 calls/pool × ≤~10 survivors, not
+ * the full 50-pool page. Skips 12h (the 1h window carries most of the
+ * acceleration signal at a 30m screening cadence).
+ *
+ * Stamps pool.volume_1h / volume_4h (raw) and pool.volume_acceleration
+ * {hourly, four_hr, accel_avg, is_accelerating}. hourly = (vol1h*24)/vol24h,
+ * four_hr = (vol4h*6)/vol24h — >1 means the short window is outrunning the
+ * 24h average. accel_avg weights 1h 3:2 over 4h (scanner's ratio minus the
+ * dropped 12h term).
+ */
+async function enrichVolumeAcceleration(rawPools, tier = "degen") {
+  if (!Array.isArray(rawPools) || rawPools.length === 0) return;
+  const needsFetch = rawPools.filter((pool) => {
+    const has1h = Number.isFinite(Number(pool?.volume_1h));
+    const has4h = Number.isFinite(Number(pool?.volume_4h));
+    return !(has1h && has4h);
+  });
+  if (needsFetch.length === 0) {
+    // Even when volumes are pre-stamped, (re)compute the acceleration object
+    // so condensePool/stageSignals have it. vol24 comes from enrichFee24hForPools.
+    for (const pool of rawPools) stampVolumeAcceleration(pool);
+    return;
+  }
+
+  const results = await Promise.allSettled(
+    needsFetch.flatMap((pool) => ["1h", "4h"].map((tf) =>
+      fetchPoolDiscoveryDetail({ poolAddress: pool.pool_address, timeframe: tf })
+        .then((detail) => ({ poolAddress: pool.pool_address, tf, volume: numeric(detail?.volume) }))
+    ))
+  );
+  let enriched = 0;
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    const { poolAddress, tf, volume } = result.value;
+    const pool = needsFetch.find((p) => p.pool_address === poolAddress);
+    if (!pool) continue;
+    if (Number.isFinite(volume) && volume >= 0) {
+      pool[`volume_${tf}`] = volume;
+      enriched++;
+    }
+  }
+  for (const pool of rawPools) stampVolumeAcceleration(pool);
+  if (enriched > 0) log("screening", `${tier}: fetched 1h+4h volume for ${enriched}/${needsFetch.length * 2} call(s) across ${needsFetch.length} pool(s)`);
+}
+
+function stampVolumeAcceleration(pool) {
+  if (!pool) return;
+  const vol24 = Number(pool.volume_24h) || 0;
+  if (vol24 <= 0) {
+    pool.volume_acceleration = null;
+    return;
+  }
+  // A window that failed to fetch (429/network) leaves volume_1h/4h undefined.
+  // Treating that as 0 volume would manufacture a false "decelerating" signal
+  // (hourlyAccel=0 drags the weighted avg down). Instead compute the average
+  // from whichever windows actually succeeded, and flag partial data so the
+  // LLM can discount it.
+  const has1h = Number.isFinite(Number(pool.volume_1h));
+  const has4h = Number.isFinite(Number(pool.volume_4h));
+  if (!has1h && !has4h) {
+    pool.volume_acceleration = null;
+    return;
+  }
+  const vol1h = Number(pool.volume_1h) || 0;
+  const vol4h = Number(pool.volume_4h) || 0;
+  const hourlyAccel = has1h ? (vol1h * 24) / vol24 : null; // >1 = accelerating now
+  const fourHrAccel = has4h ? (vol4h * 6) / vol24 : null;  // >1 = accelerating now
+  // Weighted average over available windows (1h weight 3, 4h weight 2). A
+  // missing window is excluded from the average rather than counted as 0.
+  let weightedSum = 0;
+  let totalW = 0;
+  if (hourlyAccel != null) { weightedSum += hourlyAccel * 3; totalW += 3; }
+  if (fourHrAccel != null) { weightedSum += fourHrAccel * 2; totalW += 2; }
+  const accelAvg = totalW > 0 ? weightedSum / totalW : 0;
+  pool.volume_acceleration = {
+    hourly: hourlyAccel != null ? +hourlyAccel.toFixed(2) : null,
+    four_hr: fourHrAccel != null ? +fourHrAccel.toFixed(2) : null,
+    accel_avg: +accelAvg.toFixed(2),
+    is_accelerating: accelAvg > 1,
+    partial: !(has1h && has4h), // true if a window fetch failed — discount accordingly
+  };
+}
+
+/**
  * Fee gate: OR-logic between a ratio floor and an absolute USD floor.
  * A pool passes if EITHER:
  *   - fee_active_tvl_ratio >= minFeeActiveTvlRatio (ratio gate — catches efficient small pools), OR
@@ -942,6 +1033,11 @@ async function fetchTierPools(s, tier, page_size, { timeframe, category } = {}) 
     return false;
   });
 
+  // Enrich SURVIVORS with 1h+4h volume for the acceleration signal. Runs after
+  // the hard-filter pass so the cost is bounded to ≤~10 pools, not the full
+  // page. 24h volume (volume_24h) is already stamped by enrichFee24hForPools.
+  await enrichVolumeAcceleration(thresholdedRawPools, tier);
+
   // Tag each surviving pool with the tier that admitted it.
   for (const pool of thresholdedRawPools) pool._tier = tier;
 
@@ -1270,6 +1366,7 @@ function condensePool(p) {
     volume_24h: round(p.volume_24h) ?? null, // real 24h volume (from enrichFee24hForPools)
     fee_active_tvl_ratio: p.fee_active_tvl_ratio != null ? fix(p.fee_active_tvl_ratio, 4) : null,
     fee_active_tvl_ratio_24h: p.fee_active_tvl_ratio_24h != null ? fix(p.fee_active_tvl_ratio_24h, 4) : null,
+    expected_fee_yield: computeExpectedFeeYield(p),
     volatility: fix(p.volatility, 4),
     volatility_timeframe: p.volatility_timeframe || getVolatilityTimeframe(config.screening.timeframe),
 
@@ -1322,6 +1419,7 @@ function condensePool(p) {
 
     // Liquidity-relative + LP-activity metrics (Degen Score inputs)
     volume_active_tvl_ratio: p.volume_active_tvl_ratio != null ? fix(p.volume_active_tvl_ratio, 4) : null,
+    volume_acceleration: p.volume_acceleration || null,
     unique_lps: p.unique_lps,
     unique_lps_change_pct: fix(p.unique_lps_change_pct, 1),
     positions_created: p.positions_created,
@@ -1336,6 +1434,37 @@ function fix(n, decimals) {
   const value = Number(n);
   return Number.isFinite(value) ? Number(value.toFixed(decimals)) : null;
 }
+
+/**
+ * Expected fee yield at our chosen concentration vs. full-range.
+ * Ported from meteora-scanner's optimizePosition fee projection:
+ *   daily_fee_pct = (fee / active_tvl) × concentration_multiplier × 100
+ * concentration_multiplier = avg_pool_bins / our_total_bins, capped at 8×
+ * (scanner heuristic: avg pool uses ~40 bins). our_total_bins is estimated
+ * from the bins_below midpoint the LLM is instructed to use (index.js);
+ * `defaultBinsBelow` is the planning estimate since the LLM picks the final
+ * number post-deploy. Prefers the 24h fee ratio (enrichFee24hForPools) over
+ * the noisy timeframe ratio. Exposed for LLM visibility + Darwinian
+ * attribution only — not a gate.
+ */
+function computeExpectedFeeYield(p) {
+  const feeRatio = Number(p?.fee_active_tvl_ratio_24h ?? p?.fee_active_tvl_ratio) || 0;
+  if (!(feeRatio > 0)) return null;
+  const AVG_POOL_BINS = 40;
+  const estBinsBelow = Number(config.strategy?.defaultBinsBelow)
+    || Number(config.strategy?.maxBinsBelow)
+    || 69;
+  const estTotalBins = Math.max(35, 2 * estBinsBelow + 1);
+  const concMultiplier = Math.min(AVG_POOL_BINS / estTotalBins, 8);
+  const dailyPct = feeRatio * concMultiplier * 100;
+  return {
+    daily_pct: +dailyPct.toFixed(3),
+    weekly_pct: +(dailyPct * 7).toFixed(2),
+    concentration_multiplier: +concMultiplier.toFixed(2),
+    fee_ratio_source: p?.fee_active_tvl_ratio_24h != null ? "24h" : "timeframe",
+  };
+}
+
 
 function pushFilteredReason(list, pool, reason) {
   if (!list || !pool) return;

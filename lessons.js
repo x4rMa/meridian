@@ -38,6 +38,13 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "age_band",
   "screening_profile",
   "tier",
+  // Multi-timeframe volume acceleration + fee projection (ported from
+  // meteora-scanner). Persisted for Darwinian attribution + analyze-performance
+  // bucketing of realized PnL by entry-time acceleration / expected yield.
+  "volume_acceleration_avg",
+  "volume_accelerating",
+  "expected_fee_yield_daily",
+  "expected_fee_yield_concentration",
 ];
 const MAX_MANUAL_LESSON_LENGTH = 400;
 

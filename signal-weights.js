@@ -32,6 +32,11 @@ const SIGNAL_NAMES = [
   "entry_mcap",
   "entry_tvl",
   "entry_volume",
+  // Multi-timeframe volume acceleration + fee projection (meteora-scanner port).
+  "volume_acceleration_avg",
+  "volume_accelerating",
+  "expected_fee_yield_daily",
+  "expected_fee_yield_concentration",
 ];
 
 const DEFAULT_WEIGHTS = Object.fromEntries(SIGNAL_NAMES.map((s) => [s, 1.0]));
@@ -44,10 +49,11 @@ const HIGHER_IS_BETTER = new Set([
   "holder_count",
   "study_win_rate",
   "hive_consensus",
+  "expected_fee_yield_daily",
 ]);
 
 // Boolean signals — compared by win rate when present vs absent
-const BOOLEAN_SIGNALS = new Set(["smart_wallets_present"]);
+const BOOLEAN_SIGNALS = new Set(["smart_wallets_present", "volume_accelerating"]);
 
 // Categorical signals — compared by win rate across categories
 const CATEGORICAL_SIGNALS = new Set(["narrative_quality"]);

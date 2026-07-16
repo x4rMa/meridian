@@ -636,6 +636,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const block = [
         `POOL: ${pool.name} (${pool.pool}) [tier: ${pool.tier || "degen"}${pool.age_band ? `, band: ${pool.age_band}` : ""}]`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, fee_24h=$${pool.fee_24h ?? "?"}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
+        pool.volume_acceleration
+          ? `  accel: 1h×24/24h=${pool.volume_acceleration.hourly ?? "?"}, 4h×6/24h=${pool.volume_acceleration.four_hr ?? "?"}${pool.volume_acceleration.is_accelerating ? " ⚡ ACCELERATING" : ""}${pool.volume_acceleration.partial ? " (partial data)" : ""}`
+          : null,
+        pool.expected_fee_yield
+          ? `  expected yield: ~${pool.expected_fee_yield.daily_pct}%/day at ${pool.expected_fee_yield.concentration_multiplier}x concentration (${pool.expected_fee_yield.fee_ratio_source} fee ratio)`
+          : null,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
@@ -672,6 +678,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
           age_band:              pool.age_band               ?? null,
           screening_profile:     pool.screening_profile      ?? null,
           tier:                  pool.tier                   ?? "degen",
+          volume_acceleration_avg: pool.volume_acceleration?.accel_avg ?? null,
+          volume_accelerating:     Boolean(pool.volume_acceleration?.is_accelerating),
+          expected_fee_yield_daily:        pool.expected_fee_yield?.daily_pct ?? null,
+          expected_fee_yield_concentration: pool.expected_fee_yield?.concentration_multiplier ?? null,
         });
       }
 
