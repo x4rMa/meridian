@@ -283,6 +283,7 @@ const { values: flags } = parseArgs({
     bucket:       { type: "string" },
     bins:         { type: "string" },
     metric:       { type: "string" },
+    correlate:    { type: "string" },
     "min-trades": { type: "string" },
   },
   allowPositionals: true,
@@ -640,13 +641,16 @@ switch (subcommand) {
   // field-agnostic — works for entry_mcap, fee_tvl_ratio, holder_count, etc.
   case "analyze-performance": {
     const bucket = flags.bucket;
-    if (!bucket) die("Usage: meridian analyze-performance --bucket <field> [--bins <edges>] [--metric pnl_pct] [--min-trades 3]\n  Example: meridian analyze-performance --bucket token_age_hours --bins 0,72,168,720,1440+");
+    if (!bucket) die("Usage: meridian analyze-performance --bucket <field> [--bins <edges>] [--metric pnl_pct] [--correlate <field>] [--min-trades 3]\n  Example: meridian analyze-performance --bucket token_age_hours --bins 0,72,168,720,1440+\n  Example: meridian analyze-performance --bucket price_change_1h --correlate time_to_oor_minutes");
     const { getAllPerformance } = await import("./lessons.js");
     const rows = getAllPerformance();
     if (!rows.length) { out({ message: "No closed positions recorded yet.", buckets: [] }); break; }
 
     const metric = flags.metric || "pnl_pct";
     const minTrades = flags["min-trades"] ? parseInt(flags["min-trades"]) : 1;
+    // --correlate <field>: per-bucket Pearson r between the bucket field and <field>.
+    // Answers "does this feature predict the target?" (e.g. price_change_1h vs time_to_oor_minutes).
+    const correlate = flags.correlate || null;
 
     // Resolve a (possibly dotted) field from a row. Bare names fall back to
     // signal_snapshot.<name> if the top-level key is absent — so "fee_tvl_ratio"
@@ -724,6 +728,23 @@ switch (subcommand) {
       return RUG_REASONS.has(c) || c.includes("stop loss") || c.includes("rug");
     }
 
+    // Pearson r over (bucketValue, correlateValue) pairs where both are finite numbers.
+    // Returns null when fewer than 3 paired samples (can't trust r below that).
+    function pearsonR(pairs) {
+      const n = pairs.length;
+      if (n < 3) return null;
+      const mx = pairs.reduce((s, p) => s + p.x, 0) / n;
+      const my = pairs.reduce((s, p) => s + p.y, 0) / n;
+      let num = 0, dx2 = 0, dy2 = 0;
+      for (const { x, y } of pairs) {
+        const dx = x - mx, dy = y - my;
+        num += dx * dy; dx2 += dx * dx; dy2 += dy * dy;
+      }
+      if (dx2 === 0 || dy2 === 0) return null;
+      const r = num / Math.sqrt(dx2 * dy2);
+      return Math.round(r * 1000) / 1000;
+    }
+
     const buckets = [...groups.entries()].sort((a, b) => bucketOrder(a[0], b[0])).map(([label, groupRows]) => {
       const trades = groupRows.length;
       const metrics = groupRows.map((r) => Number(resolveField(r, metric))).filter((n) => Number.isFinite(n));
@@ -735,6 +756,11 @@ switch (subcommand) {
         const p = Number(r.pnl_pct);
         return Number.isFinite(p) ? Math.min(0, p) : null;
       }).filter((n) => n != null);
+      // Paired samples for correlation: both bucket-value and correlate-value finite.
+      const corrPairs = correlate
+        ? groupRows.map((r) => ({ x: Number(resolveField(r, bucket)), y: Number(resolveField(r, correlate)) }))
+            .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+        : [];
       const sorted = [...metrics].sort((a, b) => a - b);
       const median = sorted.length ? (sorted.length % 2 ? sorted[(sorted.length - 1) >> 1] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2) : null;
       const wins = pnls.filter((p) => p > 0).length;
@@ -749,6 +775,7 @@ switch (subcommand) {
         rug_pct: trades ? Math.round((rugs / trades) * 100) : null,
         avg_fees_usd: avg(fees) != null ? Math.round(avg(fees) * 1000) / 1000 : null,
         max_dd_pct: maxDDs.length ? Math.round(Math.min(...maxDDs) * 100) / 100 : null,
+        ...(correlate ? { corr_r: pearsonR(corrPairs), corr_n: corrPairs.length, corr_field: correlate } : {}),
       };
     });
 
@@ -756,6 +783,7 @@ switch (subcommand) {
     const report = {
       bucket_field: bucket,
       metric,
+      ...(correlate ? { correlate } : {}),
       bins: binEdges,
       open_upper: openUpper,
       categorical: !allNumeric || binEdges == null,
@@ -765,17 +793,24 @@ switch (subcommand) {
     };
 
     // Pretty-print the table to stderr for quick reading; full JSON to stdout (out()).
-    const header = ["bucket", "trades", "avg_roi", "median_roi", "win_pct", "rug_pct", "avg_fees", "max_dd"];
+    const baseHeader = ["bucket", "trades", "avg_roi", "median_roi", "win_pct", "rug_pct", "avg_fees", "max_dd"];
+    const baseWidths = [16, 7, 9, 11, 8, 8, 11, 9];
+    const corrHeader = correlate ? [`r(${correlate})`, `n`] : [];
+    const corrWidths = correlate ? [9, 5] : [];
+    const header = [...baseHeader, ...corrHeader];
+    const widths = [...baseWidths, ...corrWidths];
     const fmt = (v, w) => String(v == null ? "-" : v).padEnd(w).slice(0, w);
-    console.error(`\nanalyze-performance — bucket=${bucket} metric=${metric} (n=${rows.length})`);
-    console.error(header.map((h, i) => fmt(h, [16, 7, 9, 11, 8, 8, 11, 9][i])).join("  "));
-    console.error("-".repeat(88));
+    console.error(`\nanalyze-performance — bucket=${bucket} metric=${metric}${correlate ? ` correlate=${correlate}` : ""} (n=${rows.length})`);
+    console.error(header.map((h, i) => fmt(h, widths[i])).join("  "));
+    console.error("-".repeat(widths.reduce((s, w) => s + w + 2, 0)));
     for (const b of report.buckets) {
-      console.error([
-        fmt(b.bucket, 16), fmt(b.trades, 7), fmt(b.avg_roi, 9), fmt(b.median_roi, 11),
-        fmt(b.win_pct != null ? b.win_pct + "%" : "-", 8), fmt(b.rug_pct != null ? b.rug_pct + "%" : "-", 8),
-        fmt(b.avg_fees_usd, 11), fmt(b.max_dd_pct, 9),
-      ].join("  "));
+      const base = [
+        fmt(b.bucket, widths[0]), fmt(b.trades, widths[1]), fmt(b.avg_roi, widths[2]), fmt(b.median_roi, widths[3]),
+        fmt(b.win_pct != null ? b.win_pct + "%" : "-", widths[4]), fmt(b.rug_pct != null ? b.rug_pct + "%" : "-", widths[5]),
+        fmt(b.avg_fees_usd, widths[6]), fmt(b.max_dd_pct, widths[7]),
+      ];
+      const corr = correlate ? [fmt(b.corr_r, widths[8]), fmt(b.corr_n, widths[9])] : [];
+      console.error([...base, ...corr].join("  "));
     }
     if (report.buckets_below_min.length) {
       console.error(`\nbuckets below min-trades (${minTrades}): ${report.buckets_below_min.map((b) => `${b.bucket}(${b.trades})`).join(", ")}`);

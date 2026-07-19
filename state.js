@@ -203,6 +203,12 @@ export function markOutOfRange(position_address) {
   if (!pos) return;
   if (!pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
+    // Store time-to-OOR once so analyze-performance can correlate it with deploy-time
+    // signals (price_change_1h, volume_acceleration, volatility) without recomputing.
+    if (pos.deployed_at) {
+      const mins = (Date.now() - new Date(pos.deployed_at).getTime()) / 60000;
+      pos.time_to_oor_minutes = Math.round(mins * 100) / 100;
+    }
     save(state);
     log("state", `Position ${position_address} marked out of range`);
   }
@@ -284,6 +290,32 @@ export function setPositionInstruction(position_address, instruction) {
   pos.instruction = sanitizeStoredText(instruction);
   save(state);
   log("state", `Position ${position_address} instruction set: ${pos.instruction}`);
+  return true;
+}
+
+// Stamp the exit-indicator-gate result on the position so the close path's
+// recordPerformance call can attribute the close (or veto) to the gate that
+// was consulted. Persisted because the gate runs in executeManagementActions
+// (in-memory) but the perf record is built later in dlmm.js from state.json.
+export function setPositionIndicatorExitCheck(position_address, check) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return false;
+  pos.indicator_exit_check = check ?? null;
+  save(state);
+  return true;
+}
+
+// Stamp the canonical exit reason (STOP_LOSS, TRAILING_TP, OUT_OF_RANGE, etc.)
+// on the position so analyze-performance can bucket by a stable enum rather
+// than the templated close_reason string. Persisted for the same reason as
+// indicator_exit_check — stamped in executeManagementActions, read in dlmm.js.
+export function setPositionExitReason(position_address, exitReason) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return false;
+  pos.exit_reason = exitReason ?? null;
+  save(state);
   return true;
 }
 
@@ -461,6 +493,30 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   let changed = false;
 
+  // ── Post-deploy early-return sampling (OOR-predictor instrumentation) ────────
+  // Capture pnl_pct at the 5/15/30-min marks + the max pnl in the first 15 min.
+  // Rides the existing 3s poller tick — last-write-wins within each window so the
+  // recorded value is the one closest to the boundary. Pure measurement: never
+  // affects exit logic. Skipped on suspicious ticks to avoid poisoning the sample.
+  if (!pnl_pct_suspicious && Number.isFinite(currentPnlPct) && pos.deployed_at) {
+    const minutesSinceDeploy = (Date.now() - new Date(pos.deployed_at).getTime()) / 60000;
+    if (minutesSinceDeploy <= 5) {
+      pos.first_5m_return_pct = Math.round(currentPnlPct * 100) / 100;
+      changed = true;
+    }
+    if (minutesSinceDeploy <= 15) {
+      pos.first_15m_return_pct = Math.round(currentPnlPct * 100) / 100;
+      if (currentPnlPct > (pos.max_pnl_pct_first_15m ?? -Infinity)) {
+        pos.max_pnl_pct_first_15m = Math.round(currentPnlPct * 100) / 100;
+      }
+      changed = true;
+    }
+    if (minutesSinceDeploy <= 30) {
+      pos.first_30m_return_pct = Math.round(currentPnlPct * 100) / 100;
+      changed = true;
+    }
+  }
+
   // Activate trailing TP once trigger threshold is reached
   if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= mgmtConfig.trailingTriggerPct) {
     pos.trailing_active = true;
@@ -471,6 +527,10 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // Update OOR state
   if (in_range === false && !pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
+    if (pos.deployed_at) {
+      const mins = (Date.now() - new Date(pos.deployed_at).getTime()) / 60000;
+      pos.time_to_oor_minutes = Math.round(mins * 100) / 100;
+    }
     changed = true;
     log("state", `Position ${position_address} marked out of range`);
   } else if (in_range === true && pos.out_of_range_since) {

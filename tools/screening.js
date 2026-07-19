@@ -533,7 +533,9 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
   // 20s hard timeout — without this a hung API connection stalls the screener
   // forever (the .catch(() => null) in runScreeningCycle can't help if the
   // promise never settles). AbortSignal.timeout lands a rejection instead.
-  const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+  // 429/5xx retry/backoff is handled by fetchPoolDiscoveryWithRetry; the abort
+  // signal still caps each attempt at 20s so a hung connection can't stack.
+  const res = await fetchPoolDiscoveryWithRetry(url, { signal: AbortSignal.timeout(20000) });
 
   if (!res.ok) {
     throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
@@ -548,7 +550,7 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
     `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
     `&timeframe=${timeframe}`;
 
-  const res = await fetch(url);
+  const res = await fetchPoolDiscoveryWithRetry(url);
 
   if (!res.ok) {
     throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
@@ -750,6 +752,45 @@ const GMGN_RECON_THROTTLE_MS = 150;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Pool-discovery 429 recovery. The Meteora data API rate-limits aggressively and a
+// single 429 used to void a whole tier's fetch for the cycle (and then the deploy
+// safety re-fetch would fail too — "Could not verify pool screening thresholds").
+// Retry transient rate-limit/5xx responses with exponential backoff before giving up.
+const POOL_DISCOVERY_MAX_RETRIES = 3;
+const POOL_DISCOVERY_BASE_BACKOFF_MS = 2000;
+const POOL_DISCOVERY_RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+export async function fetchPoolDiscoveryWithRetry(url, { signal } = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= POOL_DISCOVERY_MAX_RETRIES; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, signal ? { signal } : undefined);
+    } catch (error) {
+      // Network/abort errors: retry once on transient, else rethrow.
+      if (attempt < POOL_DISCOVERY_MAX_RETRIES && error?.name !== "AbortError") {
+        await sleep(POOL_DISCOVERY_BASE_BACKOFF_MS * 2 ** attempt);
+        lastError = error;
+        continue;
+      }
+      throw error;
+    }
+    if (res.ok) return res;
+    if (POOL_DISCOVERY_RETRY_STATUSES.has(res.status) && attempt < POOL_DISCOVERY_MAX_RETRIES) {
+      const retryAfter = Number(res.headers.get("retry-after"));
+      const backoff = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : POOL_DISCOVERY_BASE_BACKOFF_MS * 2 ** attempt;
+      log("screening", `pool-discovery ${res.status} on attempt ${attempt + 1}/${POOL_DISCOVERY_MAX_RETRIES + 1}, retrying in ${Math.round(backoff / 1000)}s`);
+      await sleep(backoff);
+      lastError = new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+      continue;
+    }
+    throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+  }
+  throw lastError ?? new Error("Pool Discovery API error: retries exhausted");
 }
 
 /**

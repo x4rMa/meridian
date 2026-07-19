@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, fetchPoolDiscoveryWithRetry } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -22,6 +22,7 @@ import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, normalizeTokenAgeBands } from "../config.js";
+import { validateConfig } from "../validate-config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import { execSync, spawn } from "child_process";
@@ -187,7 +188,7 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   const encodedTimeframe = encodeURIComponent(timeframe);
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
   const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
-  const res = await fetch(url);
+  const res = await fetchPoolDiscoveryWithRetry(url);
   if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
   return (data?.data || [])[0] ?? null;
@@ -403,6 +404,8 @@ function normalizeConfigValue(key, value) {
     "midcapBypassTimingFilters",
     "useGmgnTrending",
     "markovEnabled",
+    "rsiDivergenceAllowHidden",
+    "exitGateEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals"]);
   const jsonObjectKeys = new Set(["tokenAgeBands"]);
@@ -693,6 +696,19 @@ const toolMap = {
       stochRsiOversold: ["indicators", "stochRsiOversold", ["chartIndicators", "stochRsiOversold"]],
       stochRsiOverbought: ["indicators", "stochRsiOverbought", ["chartIndicators", "stochRsiOverbought"]],
       requireAllIntervals: ["indicators", "requireAllIntervals", ["chartIndicators", "requireAllIntervals"]],
+      // rsi_divergence preset params
+      rsiDivergenceLookback: ["indicators", "rsiDivergenceLookback", ["chartIndicators", "rsiDivergenceLookback"]],
+      rsiDivergenceAllowHidden: ["indicators", "rsiDivergenceAllowHidden", ["chartIndicators", "rsiDivergenceAllowHidden"]],
+      rsiDivergencePivotStrength: ["indicators", "rsiDivergencePivotStrength", ["chartIndicators", "rsiDivergencePivotStrength"]],
+      // vwap_cross preset params
+      vwapPeriod: ["indicators", "vwapPeriod", ["chartIndicators", "vwapPeriod"]],
+      vwapDeviation: ["indicators", "vwapDeviation", ["chartIndicators", "vwapDeviation"]],
+      // ath_drawdown preset params
+      athLookbackHours: ["indicators", "athLookbackHours", ["chartIndicators", "athLookbackHours"]],
+      maxAthDrawdownPct: ["indicators", "maxAthDrawdownPct", ["chartIndicators", "maxAthDrawdownPct"]],
+      minDrawdownFromAth: ["indicators", "minDrawdownFromAth", ["chartIndicators", "minDrawdownFromAth"]],
+      // exit-side indicator gate toggle (discretionary exits only)
+      exitGateEnabled: ["indicators", "exitGateEnabled", ["chartIndicators", "exitGateEnabled"]],
       // markov
       markovEnabled: ["markov", "enabled"],
       markovWindowMinutes: ["markov", "windowMinutes"],
@@ -755,6 +771,51 @@ const toolMap = {
       applied.minVolume = scaled.minVolume;
       applied._timeframeScaled = true;
       log("config", `timeframe ${tf} → auto-scaled minFeeActiveTvlRatio=${scaled.minFeeActiveTvlRatio}, minVolume=${scaled.minVolume}`);
+    }
+
+    // Validate the candidate config BEFORE mutating the live config object.
+    // Deep-clone the live config (pure data — no functions on the `config` object),
+    // apply the pending changes to the clone, simulate the raw post-write shape for
+    // the inert-key warning, then run validateConfig. If validation fails, return
+    // the same error shape as other rejections — live config is never touched.
+    const candidateConfig = structuredClone(config);
+    for (const [key, val] of Object.entries(applied)) {
+      if (key.startsWith("_")) continue;
+      const entry = CONFIG_MAP[key];
+      if (!entry) continue;
+      const [section, field] = entry;
+      if (!candidateConfig[section]) candidateConfig[section] = {};
+      candidateConfig[section][field] = key === "tokenAgeBands" ? normalizeTokenAgeBands(val) : val;
+    }
+    const candidateRaw = { ...userConfig };
+    for (const [key, val] of Object.entries(applied)) {
+      if (key.startsWith("_")) continue;
+      const persistPath = CONFIG_MAP[key]?.[2];
+      if (Array.isArray(persistPath) && persistPath.length > 0) {
+        let target = candidateRaw;
+        for (const part of persistPath.slice(0, -1)) {
+          if (!target[part] || typeof target[part] !== "object") target[part] = {};
+          target = target[part];
+        }
+        target[persistPath[persistPath.length - 1]] = val;
+      } else {
+        candidateRaw[key] = val;
+      }
+    }
+    const validation = validateConfig(candidateConfig, candidateRaw);
+    if (!validation.ok) {
+      log("config", `update_config REJECTED by validator: ${validation.fatal.join("; ")}`);
+      const indicatorKey = Object.keys(applied).find((k) => CONFIG_MAP[k]?.[0] === "indicators");
+      return {
+        success: false,
+        error: validation.fatal.join("; "),
+        key: indicatorKey || Object.keys(applied)[0],
+        reason,
+        validation: validation.fatal,
+      };
+    }
+    if (validation.warnings?.length > 0) {
+      log("config", `update_config validation warnings: ${validation.warnings.join("; ")}`);
     }
 
     // Apply to live config immediately after the persisted config is known-good.

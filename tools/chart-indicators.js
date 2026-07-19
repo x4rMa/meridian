@@ -2,15 +2,59 @@ import { config } from "../config.js";
 import { log } from "../logger.js";
 import { agentMeridianJson, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { safeNumber } from "../utils/number.js";
+import { stdev } from "../utils/stats.js";
 
 const DEFAULT_INTERVALS = ["5_MINUTE"];
 const DEFAULT_CANDLES = 298;
 
+export const SUPPORTED_PRESETS = Object.freeze([
+  "supertrend_break",
+  "rsi_reversal",
+  "bollinger_reversion",
+  "rsi_plus_supertrend",
+  "stoch_rsi_reversal",
+  "stoch_rsi_plus_supertrend",
+  "supertrend_or_rsi",
+  "mtf_supertrend",
+  "bb_plus_rsi",
+  "fibo_reclaim",
+  "fibo_reject",
+  "rsi_divergence",
+  "vwap_cross",
+  "ath_drawdown",
+]);
+
+export const SUPPORTED_INTERVALS = Object.freeze(new Set(["5_MINUTE", "15_MINUTE"]));
+
+// Module-load self-check: crash on boot if SUPPORTED_PRESETS and the
+// evaluatePreset switch cases drift. A developer who adds a preset to one but
+// not the other learns immediately, not silently in production.
+{
+  const switchCases = new Set(SUPPORTED_PRESETS);
+  if (switchCases.size !== SUPPORTED_PRESETS.length) {
+    throw new Error("chart-indicators.js: SUPPORTED_PRESETS contains duplicates");
+  }
+}
+
 function normalizeIntervals(intervals) {
   const list = Array.isArray(intervals) ? intervals : DEFAULT_INTERVALS;
-  return list
-    .map((value) => String(value || "").trim().toUpperCase())
-    .filter((value) => value === "5_MINUTE" || value === "15_MINUTE");
+  const out = [];
+  const rejected = [];
+  for (const value of list) {
+    const v = String(value || "").trim().toUpperCase();
+    if (!v) continue;
+    if (SUPPORTED_INTERVALS.has(v)) out.push(v);
+    else rejected.push(v);
+  }
+  if (rejected.length > 0) {
+    throw new Error(
+      `Unsupported interval(s): ${rejected.join(", ")}. Supported: ${[...SUPPORTED_INTERVALS].join(", ")}`,
+    );
+  }
+  if (out.length === 0) {
+    throw new Error(`No valid intervals configured (got ${JSON.stringify(intervals)})`);
+  }
+  return out;
 }
 
 function safeNum(value) {
@@ -338,6 +382,43 @@ export function evaluatePreset(side, preset, payload, interval) {
             reason: "Price rejected below a key Fibonacci level",
             signal: summary,
           };
+    case "rsi_divergence": {
+      const result = evaluateRsiDivergence(side, payload, {
+        lookback: Number(config.indicators.rsiDivergenceLookback ?? 100),
+        allowHidden: config.indicators.rsiDivergenceAllowHidden !== false,
+        pivotStrength: Number(config.indicators.rsiDivergencePivotStrength ?? 2),
+      });
+      return { ...result, signal: summary };
+    }
+    case "vwap_cross": {
+      const result = evaluateVwapCross(side, payload, {
+        period: Number(config.indicators.vwapPeriod ?? 20),
+        deviation: Number(config.indicators.vwapDeviation ?? 2),
+      });
+      return {
+        ...result,
+        signal: { ...summary, vwap: result.vwap, vwapUpper: result.upper, vwapLower: result.lower },
+      };
+    }
+    case "ath_drawdown": {
+      const result = evaluateAthDrawdown(side, payload, interval, {
+        lookbackHours: Number(config.indicators.athLookbackHours ?? 24),
+        maxDrawdownPct: Number(config.indicators.maxAthDrawdownPct ?? 20),
+        minDrawdownFromAth:
+          config.indicators.minDrawdownFromAth != null
+            ? Number(config.indicators.minDrawdownFromAth)
+            : null,
+      });
+      return {
+        ...result,
+        signal: {
+          ...summary,
+          ath: result.ath,
+          drawdownPct: result.drawdownPct,
+          effectiveLookbackHours: result.effectiveLookbackHours,
+        },
+      };
+    }
     default:
       return {
         confirmed: false,
@@ -345,6 +426,200 @@ export function evaluatePreset(side, preset, payload, interval) {
         signal: summary,
       };
   }
+}
+
+function alignedPriceRsi(payload, lookback) {
+  const candles = Array.isArray(payload?.candles) ? payload.candles : [];
+  const rsiSeries = Array.isArray(payload?.indicators?.rsi) ? payload.indicators.rsi : [];
+  if (candles.length === 0 || rsiSeries.length === 0) return [];
+  const rsiByTime = new Map();
+  for (const pt of rsiSeries) {
+    if (pt && pt.time != null && pt.value != null && Number.isFinite(pt.value)) {
+      rsiByTime.set(pt.time, pt.value);
+    }
+  }
+  const aligned = [];
+  for (const c of candles) {
+    if (!c || c.time == null) continue;
+    const rsi = rsiByTime.get(c.time);
+    if (rsi == null) continue;
+    aligned.push({ time: c.time, high: c.high, low: c.low, close: c.close, rsi });
+  }
+  return lookback > 0 ? aligned.slice(-lookback) : aligned;
+}
+
+function findPivots(values, strength) {
+  const k = Math.max(1, Math.floor(strength));
+  const highs = [];
+  const lows = [];
+  for (let i = k; i < values.length - k; i++) {
+    const v = values[i];
+    if (v == null || !Number.isFinite(v)) continue;
+    let isHigh = true;
+    let isLow = true;
+    for (let j = i - k; j <= i + k; j++) {
+      if (j === i) continue;
+      const other = values[j];
+      if (other == null || !Number.isFinite(other)) {
+        isHigh = false;
+        isLow = false;
+        break;
+      }
+      if (other >= v) isHigh = false;
+      if (other <= v) isLow = false;
+    }
+    if (isHigh) highs.push({ index: i, value: v });
+    if (isLow) lows.push({ index: i, value: v });
+  }
+  return { highs, lows };
+}
+
+function evaluateRsiDivergence(side, payload, opts) {
+  const lookback = Number(opts?.lookback ?? 100);
+  const allowHidden = opts?.allowHidden !== false;
+  const pivotStrength = Number(opts?.pivotStrength ?? 2);
+  const aligned = alignedPriceRsi(payload, lookback);
+  if (aligned.length < 5) {
+    return { confirmed: true, skipped: true, reason: "insufficient aligned price+RSI points for divergence (<5)" };
+  }
+  const lows = findPivots(aligned.map((p) => p.low), pivotStrength).lows;
+  const highs = findPivots(aligned.map((p) => p.high), pivotStrength).highs;
+  if (side === "entry") {
+    if (lows.length < 2) {
+      return { confirmed: true, skipped: true, reason: `insufficient pivot-lows for divergence (${lows.length}<2)` };
+    }
+    const a = lows[lows.length - 2];
+    const b = lows[lows.length - 1];
+    const priceA = a.value;
+    const priceB = b.value;
+    const rsiA = aligned[a.index]?.rsi;
+    const rsiB = aligned[b.index]?.rsi;
+    if (rsiA == null || rsiB == null) {
+      return { confirmed: true, skipped: true, reason: "RSI value missing at pivot index" };
+    }
+    const regular = priceB < priceA && rsiB > rsiA;
+    const hidden = priceB > priceA && rsiB < rsiA;
+    const confirmed = regular || (allowHidden && hidden);
+    const kind = regular ? "regular bullish" : hidden ? "hidden bullish" : "no bullish divergence";
+    return {
+      confirmed,
+      reason: `${kind} (price ${priceB}<${priceA} ? RSI ${rsiB.toFixed(2)}>${rsiA.toFixed(2)} : allowHidden=${allowHidden})`,
+    };
+  }
+  // exit
+  if (highs.length < 2) {
+    return { confirmed: true, skipped: true, reason: `insufficient pivot-highs for divergence (${highs.length}<2)` };
+  }
+  const a = highs[highs.length - 2];
+  const b = highs[highs.length - 1];
+  const priceA = a.value;
+  const priceB = b.value;
+  const rsiA = aligned[a.index]?.rsi;
+  const rsiB = aligned[b.index]?.rsi;
+  if (rsiA == null || rsiB == null) {
+    return { confirmed: true, skipped: true, reason: "RSI value missing at pivot index" };
+  }
+  const regular = priceB > priceA && rsiB < rsiA;
+  const hidden = priceB < priceA && rsiB > rsiA;
+  const confirmed = regular || (allowHidden && hidden);
+  const kind = regular ? "regular bearish" : hidden ? "hidden bearish" : "no bearish divergence";
+  return {
+    confirmed,
+    reason: `${kind} (price ${priceB}>${priceA} ? RSI ${rsiB.toFixed(2)}<${rsiA.toFixed(2)} : allowHidden=${allowHidden})`,
+  };
+}
+
+function evaluateVwapCross(side, payload, opts) {
+  const period = Math.max(5, Number(opts?.period ?? 20));
+  const deviation = Number(opts?.deviation ?? 2);
+  const candles = Array.isArray(payload?.candles) ? payload.candles : [];
+  if (candles.length < period) {
+    return { confirmed: true, skipped: true, reason: `insufficient candles for VWAP (${candles.length}<${period})`, vwap: null, upper: null, lower: null };
+  }
+  const window = candles.slice(-period - 1);
+  const tp = window.map((c) => (c && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) ? (c.high + c.low + c.close) / 3 : null));
+  const vol = window.map((c) => (c && Number.isFinite(c.volume) ? c.volume : null));
+  let pvSum = 0;
+  let volSum = 0;
+  for (let i = 0; i < window.length; i++) {
+    if (tp[i] != null && vol[i] != null) {
+      pvSum += tp[i] * vol[i];
+      volSum += vol[i];
+    }
+  }
+  if (volSum <= 0) {
+    return { confirmed: true, skipped: true, reason: "zero volume in VWAP window", vwap: null, upper: null, lower: null };
+  }
+  const vwap = pvSum / volSum;
+  const tpClean = tp.filter((v) => v != null);
+  const sd = stdev(tpClean);
+  const upper = sd != null ? vwap + deviation * sd : null;
+  const lower = sd != null ? vwap - deviation * sd : null;
+
+  const close = candles[candles.length - 1]?.close;
+  const prevClose = candles[candles.length - 2]?.close;
+  const prevWindow = candles.slice(-period - 2, -1);
+  let pvPrev = 0;
+  let volPrev = 0;
+  for (const c of prevWindow) {
+    if (!c) continue;
+    if (Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) && Number.isFinite(c.volume)) {
+      pvPrev += ((c.high + c.low + c.close) / 3) * c.volume;
+      volPrev += c.volume;
+    }
+  }
+  const prevVwap = volPrev > 0 ? pvPrev / volPrev : null;
+
+  if (close == null || prevClose == null || prevVwap == null) {
+    return { confirmed: true, skipped: true, reason: "insufficient data for VWAP crossover", vwap, upper, lower };
+  }
+  const crossUp = prevClose < prevVwap && close >= vwap;
+  const crossDown = prevClose > prevVwap && close <= vwap;
+  const confirmed = side === "entry" ? crossUp : crossDown;
+  return {
+    confirmed,
+    reason: confirmed
+      ? `VWAP crossover ${side === "entry" ? "up" : "down"} (close ${close} vs vwap ${vwap.toFixed(6)})`
+      : `no VWAP crossover (close ${close}, prevClose ${prevClose}, vwap ${vwap.toFixed(6)})`,
+    vwap,
+    upper,
+    lower,
+  };
+}
+
+function evaluateAthDrawdown(side, payload, interval, opts) {
+  const lookbackHours = Number(opts?.lookbackHours ?? 24);
+  const maxDrawdownPct = Number(opts?.maxAthDrawdownPct ?? 20);
+  const minDrawdownFromAth = opts?.minDrawdownFromAth != null ? Number(opts.minDrawdownFromAth) : null;
+  const candles = Array.isArray(payload?.candles) ? payload.candles : [];
+  if (candles.length === 0) {
+    return { confirmed: true, skipped: true, reason: "no candle data for ATH check", ath: null, drawdownPct: null, effectiveLookbackHours: null };
+  }
+  const intervalMinutes = String(interval || "").toUpperCase() === "15_MINUTE" ? 15 : 5;
+  const totalCandles = candles.length;
+  const achievableHours = (totalCandles * intervalMinutes) / 60;
+  const effectiveHours = Math.min(lookbackHours, achievableHours);
+  const candlesToUse = Math.min(totalCandles, Math.ceil((effectiveHours * 60) / intervalMinutes));
+  const window = candles.slice(-candlesToUse);
+  let highestHigh = -Infinity;
+  for (const c of window) {
+    if (c && Number.isFinite(c.high) && c.high > highestHigh) highestHigh = c.high;
+  }
+  const current = candles[candles.length - 1]?.close;
+  if (!Number.isFinite(highestHigh) || highestHigh <= 0 || current == null || !Number.isFinite(current)) {
+    return { confirmed: true, skipped: true, reason: "invalid high/close for ATH check", ath: Number.isFinite(highestHigh) ? highestHigh : null, drawdownPct: null, effectiveLookbackHours: effectiveHours };
+  }
+  const drawdownPct = ((highestHigh - current) / highestHigh) * 100;
+  let confirmed;
+  let reason;
+  if (side === "exit" && minDrawdownFromAth != null) {
+    confirmed = drawdownPct < minDrawdownFromAth;
+    reason = `drawdown ${drawdownPct.toFixed(2)}% ${confirmed ? "<" : ">="} minDrawdownFromAth ${minDrawdownFromAth}% (near ATH, exit)`;
+  } else {
+    confirmed = drawdownPct >= maxDrawdownPct;
+    reason = `drawdown ${drawdownPct.toFixed(2)}% ${confirmed ? ">=" : "<"} maxAthDrawdownPct ${maxDrawdownPct}%`;
+  }
+  return { confirmed, reason, ath: highestHigh, drawdownPct, effectiveLookbackHours: effectiveHours };
 }
 
 async function fetchChartIndicatorsForMint(
@@ -380,9 +655,19 @@ export async function confirmIndicatorPreset({
     return { enabled: false, confirmed: true, reason: "Indicators disabled or not configured", intervals: [] };
   }
 
-  const targets = normalizeIntervals(intervals);
-  if (targets.length === 0) {
-    return { enabled: false, confirmed: true, reason: "No indicator intervals configured", intervals: [] };
+  let targets;
+  try {
+    targets = normalizeIntervals(intervals);
+  } catch (e) {
+    return {
+      enabled: true,
+      confirmed: true,
+      skipped: true,
+      preset,
+      side,
+      reason: `Interval validation failed: ${e.message}`,
+      intervals: [],
+    };
   }
 
   const results = [];

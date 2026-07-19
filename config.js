@@ -359,6 +359,30 @@ export const config = {
     stochRsiOversold: indicatorUserConfig.stochRsiOversold ?? 20,
     stochRsiOverbought: indicatorUserConfig.stochRsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
+
+    // ── rsi_divergence preset ──
+    rsiDivergenceLookback: Number(indicatorUserConfig.rsiDivergenceLookback ?? 100),
+    rsiDivergenceAllowHidden: indicatorUserConfig.rsiDivergenceAllowHidden ?? true,
+    rsiDivergencePivotStrength: Number(indicatorUserConfig.rsiDivergencePivotStrength ?? 2),
+
+    // ── vwap_cross preset ──
+    vwapPeriod: Number(indicatorUserConfig.vwapPeriod ?? 20),
+    vwapDeviation: Number(indicatorUserConfig.vwapDeviation ?? 2),
+
+    // ── ath_drawdown preset ──
+    athLookbackHours: Number(indicatorUserConfig.athLookbackHours ?? 24),
+    maxAthDrawdownPct: Number(indicatorUserConfig.maxAthDrawdownPct ?? 20),
+    minDrawdownFromAth:
+      indicatorUserConfig.minDrawdownFromAth != null
+        ? Number(indicatorUserConfig.minDrawdownFromAth)
+        : null,
+
+    // Exit-side indicator gate. When true, discretionary exits (TRAILING_TP,
+    // Rule 2 take-profit) consult confirmIndicatorPreset({side:"exit"}) before
+    // closing. Risk exits (STOP_LOSS, OOR, LOW_YIELD, manual, INSTRUCTION) are
+    // NEVER gated regardless of this flag. Defaults on so the A/B test
+    // (gate-on vs gate-off) is explicit via analyze-performance bucketing.
+    exitGateEnabled: indicatorUserConfig.exitGateEnabled ?? true,
   },
 
   // ─── Markov Chain Analysis ─────────────

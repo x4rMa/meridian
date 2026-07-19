@@ -1108,6 +1108,24 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "age_band",
   "screening_profile",
   "tier",
+  // OOR-predictor instrumentation — staged at screening time (index.js) and
+  // persisted via trackPosition's signal_snapshot. Listed here so
+  // resolvePerformanceSignalSnapshot backfills them from tracked.signal_snapshot
+  // even if the 10-min staged-signal TTL expired before deploy consumed them.
+  "price_change_1h",
+  "price_change_6h",
+  "net_buyers_1h",
+  // Outcome instrumentation — set on the position object by markOutOfRange
+  // (state.js) and passed through recordPerformance by the close path.
+  "time_to_oor_minutes",
+  // Exit-gate instrumentation — stamped by setPositionIndicatorExitCheck (state.js)
+  // when the exit-indicator gate is consulted. Backfilled here so the perf record's
+  // signal_snapshot carries it for analyze-performance attribution.
+  "indicator_exit_check",
+  // Canonical exit-reason enum (STOP_LOSS, TRAILING_TP, OUT_OF_RANGE, etc.)
+  // stamped by setPositionExitReason. Stable enum for analyze-performance bucketing
+  // (vs the templated close_reason string).
+  "exit_reason",
 ];
 
 function resolvePerformanceSignalSnapshot({ poolAddress, baseMint, tracked }) {
@@ -1851,6 +1869,9 @@ export async function closePosition({ position_address, reason }) {
           entry_tvl: tracked.entry_tvl ?? null,
           entry_volume: tracked.entry_volume ?? null,
           entry_holders: tracked.entry_holders ?? null,
+          time_to_oor_minutes: tracked.time_to_oor_minutes ?? null,
+          indicator_exit_check: tracked.indicator_exit_check ?? null,
+          exit_reason: tracked.exit_reason ?? null,
           ...exitMarket,
         });
 
@@ -2159,6 +2180,9 @@ export async function closePosition({ position_address, reason }) {
         entry_tvl: tracked.entry_tvl ?? null,
         entry_volume: tracked.entry_volume ?? null,
         entry_holders: tracked.entry_holders ?? null,
+        time_to_oor_minutes: tracked.time_to_oor_minutes ?? null,
+        indicator_exit_check: tracked.indicator_exit_check ?? null,
+        exit_reason: tracked.exit_reason ?? null,
         ...exitMarket,
       });
 

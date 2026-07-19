@@ -9,7 +9,9 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
+import { confirmIndicatorPreset } from "./tools/chart-indicators.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { validateConfig } from "./validate-config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -26,7 +28,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, setPositionIndicatorExitCheck, setPositionExitReason, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { predictNextState, getMarkovSummary, calculateTransitionMatrix } from "./markov.js";
@@ -102,6 +104,14 @@ function releasePidLock() {
 }
 
 if (isMain) {
+  // PM2-only enforcement: a manual `node index.js` (no pm_id) outside DRY_RUN
+  // can outlive PM2 and hold the lock across restarts — the 2026-07-17
+  // split-brain crash-loop (545 restarts) came from exactly this. Refuse it
+  // unless explicitly opted out. DRY_RUN (npm run dev) and PM2 starts are fine.
+  if (process.env.pm_id == null && process.env.DRY_RUN !== "true" && process.env.ALLOW_NON_PM2_DAEMON !== "true") {
+    log("fatal", `Refusing to start daemon outside PM2 (no pm_id). Use "npm run pm2:start" / "npm run pm2:restart". For local dev use "npm run dev" (DRY_RUN). To override set ALLOW_NON_PM2_DAEMON=true.`);
+    process.exit(1);
+  }
   const _lockFile = path.join(DATA_ROOT, ".meridian.lock");
   if (!acquirePidLock(_lockFile)) {
     log("fatal", `Could not acquire daemon lock at ${_lockFile}. Another instance is running in this data dir (${DATA_ROOT}).`);
@@ -117,6 +127,36 @@ if (isMain) {
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
+
+  // Config validation: fatal on unknown preset / unsupported interval (refuse to
+  // boot so a bad config can never silently drop every screening candidate);
+  // warn on unrecognized top-level keys. Both startCronJobs() call sites are
+  // downstream of this point, so a fatal here prevents any cron registration.
+  try {
+    const rawUserConfig = fs.existsSync(repoPath("user-config.json"))
+      ? JSON.parse(fs.readFileSync(repoPath("user-config.json"), "utf8"))
+      : {};
+    const validation = validateConfig(config, rawUserConfig);
+    if (!validation.ok) {
+      log("fatal", "═══════════════════════════════════════════════════════════");
+      log("fatal", "❌ Invalid configuration — refusing to boot");
+      log("fatal", "═══════════════════════════════════════════════════════════");
+      for (const line of validation.fatal) log("fatal", line);
+      log("fatal", "");
+      log("fatal", "Fix user-config.json and restart. Common fixes:");
+      log("fatal", "  • entryPreset/exitPreset must be in the SUPPORTED_PRESETS list above");
+      log("fatal", "  • intervals must be a subset of {5_MINUTE, 15_MINUTE}");
+      log("fatal", "═══════════════════════════════════════════════════════════");
+      process.exit(1);
+    }
+    if (validation.warnings?.length > 0) {
+      log("startup_warn", `⚠ ${validation.warnings.join("; ")}`);
+      log("startup_warn", "(Non-fatal — booting. Remove unused keys / adjust values in user-config.json to silence.)");
+    }
+    log("startup", `✓ Config validated: entryPreset=${config.indicators.entryPreset}, exitPreset=${config.indicators.exitPreset}, intervals=[${config.indicators.intervals.join(", ")}]`);
+  } catch (e) {
+    log("fatal", `Config validation itself failed (validator bug?): ${e.message}`);
+  }
 }
 
 const TP_PCT = config.management.takeProfitPct;
@@ -215,6 +255,59 @@ function stopCronJobs() {
   _cronTasks = [];
 }
 
+// ── Exit-indicator gate cache ────────────────────────────────────
+// The 3s PnL poller re-fires TRAILING_TP every tick until it closes. Caching the
+// confirmIndicatorPreset({side:"exit"}) result per position for 30s avoids
+// re-fetching candles on every tick. Matches the position-cache TTL pattern.
+const _exitGateCache = new Map(); // position -> { ts, gate }
+const EXIT_GATE_TTL_MS = 30_000;
+
+function getCachedExitGate(positionAddress) {
+  const hit = _exitGateCache.get(positionAddress);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > EXIT_GATE_TTL_MS) {
+    _exitGateCache.delete(positionAddress);
+    return null;
+  }
+  return hit.gate;
+}
+
+// Discretionary exits eligible for indicator gating. Positive allowlist — only
+// TRAILING_TP and Rule 2 (take profit). Everything else (STOP_LOSS, OOR,
+// LOW_YIELD, Rules 1/3/4/5/6, manual, INSTRUCTION) falls through to ungated
+// close. A new rule added later defaults to "risk exit" (ungated) unless
+// explicitly added here. Fail-safe direction.
+function isDiscretionaryExit(act) {
+  if (act.rule === 2) return true;                  // Rule 2 = take profit
+  return /trailing tp/i.test(act.reason || "");     // TRAILING_TP signal
+}
+
+// Canonical short exit-reason enum for analyze-performance bucketing. The raw
+// `close_reason` string is templated with runtime numbers ("Out of range for 25m
+// (limit: 25m)"), producing 70+ distinct values that should bucket together.
+// This collapses them to a stable enum. Derived from `act.rule` (1-6 from
+// getDeterministicCloseRule, or "exit" from updatePnlAndCheckExits) plus a
+// pattern match on `act.reason` for the exit-signal path.
+function canonicalExitReason(act) {
+  // getDeterministicCloseRule path: rule is a number 1-6.
+  switch (act.rule) {
+    case 1: return "STOP_LOSS";
+    case 2: return "TAKE_PROFIT";
+    case 3: return "PUMPED_ABOVE_RANGE";
+    case 4: return "OUT_OF_RANGE";
+    case 5: return "LOW_YIELD";
+    case 6: return "MARKOV_DOWNTREND";
+  }
+  // updatePnlAndCheckExits path: rule === "exit", reason carries the signal name.
+  const r = (act.reason || "").toLowerCase();
+  if (r.startsWith("stop loss"))    return "STOP_LOSS";
+  if (r.startsWith("trailing tp")) return "TRAILING_TP";
+  if (r.includes("out of range")) return "OUT_OF_RANGE";
+  if (r.startsWith("low yield"))   return "LOW_YIELD";
+  // Manual closes, LLM agent decisions, instructions — no canonical rule.
+  return "OTHER";
+}
+
 /**
  * Execute the actions decided by the deterministic rules. CLOSE/CLAIM run directly
  * via executeTool (no LLM) — preserving all post-effects (notify, auto-swap,
@@ -237,8 +330,65 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
 
     if (act.action === "CLOSE") {
       const reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
+      // Canonical short exit-reason enum for analyze-performance bucketing.
+      // Stamped before the gate so risk AND discretionary closes both carry it.
+      p.exit_reason = canonicalExitReason(act);
+      setPositionExitReason(p.position, p.exit_reason);
+
+      // ── Exit indicator gate (discretionary exits only) ───────────────
+      // Risk exits (STOP_LOSS, OOR, LOW_YIELD, Rules 1/3/4/5/6) bypass this
+      // entirely via the isDiscretionaryExit allowlist. A `skipped` gate
+      // (data unavailable / API down) never blocks a close. Only an explicit
+      // `confirmed:false` from the preset can veto, and only for TRAILING_TP /
+      // Rule 2 take-profit. See plan: "Indicators refine discretionary exits;
+      // they must never override risk management."
+      if (
+        config.indicators?.enabled &&
+        config.indicators?.exitGateEnabled !== false &&
+        config.indicators?.exitPreset &&
+        isDiscretionaryExit(act)
+      ) {
+        let gate = getCachedExitGate(p.position);
+        if (!gate) {
+          try {
+            gate = await confirmIndicatorPreset({ mint: p.base_mint, side: "exit" });
+          } catch (e) {
+            gate = { confirmed: true, skipped: true, reason: `Indicator unavailable: ${e.message}` };
+          }
+          _exitGateCache.set(p.position, { ts: Date.now(), gate });
+        }
+        p.indicator_exit_check = {
+          preset: config.indicators.exitPreset,
+          confirmed: gate.confirmed,
+          skipped: gate.skipped ?? false,
+          reason: gate.reason,
+        };
+        setPositionIndicatorExitCheck(p.position, p.indicator_exit_check);
+
+        if (!gate.skipped && !gate.confirmed) {
+          log("indicators", `EXIT GATE rejected ${p.pair} (${reason}) — preset=${config.indicators.exitPreset} reason: ${gate.reason} → continuing monitoring`);
+          await liveMessage?.note?.(`⚠️ ${p.pair}: exit gate rejected ${reason} (${gate.reason}) — holding`);
+          appendDecision({
+            type: "skip",
+            actor: "MANAGER",
+            pool: p.pool,
+            pool_name: p.pair,
+            position: p.position,
+            summary: `Exit gate rejected ${reason}`,
+            reason: `Indicator (${config.indicators.exitPreset}): ${gate.reason}`,
+            risks: ["discretionary exit vetoed by indicator gate"],
+            metrics: { indicator_exit_check: p.indicator_exit_check, intended_reason: reason },
+            rejected: [],
+          });
+          lines.push(`${p.pair}: held — exit gate rejected (${gate.reason})`);
+          continue; // skip the close — keep monitoring
+        }
+        log("indicators", `EXIT GATE ${gate.skipped ? "skipped" : "confirmed"} ${p.pair} — preset=${config.indicators.exitPreset} reason: ${gate.reason}`);
+      }
+
       await liveMessage?.toolStart("close_position");
       const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
+      _exitGateCache.delete(p.position); // invalidate on close — position is done
       const ok = res?.success !== false && !res?.error && !res?.blocked;
       await liveMessage?.toolFinish("close_position", res, ok);
       lines.push(`${p.pair}: ${ok ? `closed (${reason})` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
@@ -682,6 +832,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
           volume_accelerating:     Boolean(pool.volume_acceleration?.is_accelerating),
           expected_fee_yield_daily:        pool.expected_fee_yield?.daily_pct ?? null,
           expected_fee_yield_concentration: pool.expected_fee_yield?.concentration_multiplier ?? null,
+          // OOR-predictor instrumentation — measured, not filtered. price_change_1h is
+          // the prime suspect for rapid OOR on a 0-upside-bin SOL-only strategy.
+          price_change_1h: ti?.stats_1h?.price_change != null ? Number(ti.stats_1h.price_change) : null,
+          price_change_6h: ti?.stats_6h_price_change ?? null,
+          net_buyers_1h:   ti?.stats_1h?.net_buyers != null ? Number(ti.stats_1h.net_buyers) : null,
         });
       }
 
@@ -1205,6 +1360,7 @@ function settingValue(key) {
     rsiLength: config.indicators.rsiLength,
     indicatorIntervals: config.indicators.intervals,
     requireAllIntervals: config.indicators.requireAllIntervals,
+    exitGateEnabled: config.indicators.exitGateEnabled,
   };
   return values[key];
 }
@@ -1304,10 +1460,21 @@ function renderSettingsMenu(page = "main") {
         settingButton("Entry: ST/RSI", "cfg:set:indicatorEntryPreset:supertrend_or_rsi"),
       ],
       [
+        settingButton("Entry: Div", "cfg:set:indicatorEntryPreset:rsi_divergence"),
+        settingButton("Entry: VWAP", "cfg:set:indicatorEntryPreset:vwap_cross"),
+        settingButton("Entry: ATH", "cfg:set:indicatorEntryPreset:ath_drawdown"),
+      ],
+      [
         settingButton("Exit: ST", "cfg:set:indicatorExitPreset:supertrend_break"),
         settingButton("Exit: RSI", "cfg:set:indicatorExitPreset:rsi_reversal"),
         settingButton("Exit: BB+RSI", "cfg:set:indicatorExitPreset:bb_plus_rsi"),
       ],
+      [
+        settingButton("Exit: Div", "cfg:set:indicatorExitPreset:rsi_divergence"),
+        settingButton("Exit: VWAP", "cfg:set:indicatorExitPreset:vwap_cross"),
+        settingButton("Exit: ATH", "cfg:set:indicatorExitPreset:ath_drawdown"),
+      ],
+      [toggleButton("exitGateEnabled", "Exit gate")],
       stepButtons("rsiLength", "RSI len", 1, { digits: 0 }),
     ];
   } else {
@@ -1406,7 +1573,7 @@ async function applySettingsMenuCallback(msg) {
     await answerCallbackQuery(msg.callbackQueryId, "Config update failed");
     return;
   }
-  page = key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals"
+  page = key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals" || key === "exitGateEnabled"
     ? "indicators"
     : ["useDiscordSignals", "blockPvpSymbols", "strategy", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow", "managementIntervalMin", "screeningIntervalMin"].includes(key)
       ? "screen"
