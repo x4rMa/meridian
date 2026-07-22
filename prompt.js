@@ -126,6 +126,7 @@ POOL MEMORY: Past losses or problems → strong skip signal.
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
 - bins_below = round(config.strategy.minBinsBelow + (candidate volatility/5)*(config.strategy.maxBinsBelow-config.strategy.minBinsBelow)) clamped to [minBinsBelow,maxBinsBelow]. Volatility must be a positive number; 0/unknown means skip.
+- DOWNSIDE RANGE: deploy_position defaults to a -${config.strategy.defaultDownsidePct ?? 75}% downside range (config.strategy.defaultDownsidePct). You usually do NOT need to pass downside_pct — omit it and the deploy uses the -75% "absorb the dump" range automatically. Only pass downside_pct to override, and only within [${config.strategy.minDownsidePct ?? 70}%, ${config.strategy.maxDownsidePct ?? 80}%] — the safety check rejects anything outside that band. A wide -75% range uses ~140 bins at bin_step 100, so deploys take the multi-tx wide-range path.
 - Use amount_y only, keep amount_x=0 and bins_above=0.
 - Bin steps must be [80-125] for degen candidates, [40-150] for midcap candidates. Always pass the candidate's tier through to deploy_position so the safety check applies the correct range.
 - Candidates carry an age band (e.g. [band: fresh] or [band: mature]) — two trading regimes: "fresh" (early discovery, <3 days) and "mature" (survivorship, >60 days). The 3–60 day rug-danger zone is excluded pre-LLM. Always pass the candidate's age_band through to deploy_position so the deploy safety check applies that band's threshold overrides.

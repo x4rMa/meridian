@@ -22,6 +22,7 @@ export const SUPPORTED_PRESETS = Object.freeze([
   "rsi_divergence",
   "vwap_cross",
   "ath_drawdown",
+  "ath_breaking",
 ]);
 
 export const SUPPORTED_INTERVALS = Object.freeze(new Set(["5_MINUTE", "15_MINUTE"]));
@@ -417,6 +418,24 @@ export function evaluatePreset(side, preset, payload, interval) {
           drawdownPct: result.drawdownPct,
           effectiveLookbackHours: result.effectiveLookbackHours,
         },
+      };
+    }
+    case "ath_breaking": {
+      const breakingThreshold = Number(config.indicators.athBreakingMaxDrawdownPct ?? 15);
+      const result = evaluateAthDrawdown(side, payload, interval, {
+        lookbackHours: Number(config.indicators.athLookbackHours ?? 24),
+        maxDrawdownPct: breakingThreshold,
+      });
+      if (result.skipped) {
+        return { ...result, signal: { ...summary, ath: result.ath, drawdownPct: result.drawdownPct } };
+      }
+      const nearAth = result.drawdownPct != null && result.drawdownPct < breakingThreshold;
+      return {
+        confirmed: nearAth,
+        reason: nearAth
+          ? `drawdown ${result.drawdownPct.toFixed(2)}% < ${breakingThreshold}% (near ATH, constant breaking)`
+          : `drawdown ${result.drawdownPct.toFixed(2)}% >= ${breakingThreshold}% (not near ATH)`,
+        signal: { ...summary, ath: result.ath, drawdownPct: result.drawdownPct, effectiveLookbackHours: result.effectiveLookbackHours },
       };
     }
     default:

@@ -326,6 +326,14 @@ function getPoolBaseMint(pool) {
     null;
 }
 
+function getPoolQuoteMint(pool) {
+  return pool?.token_y?.address ||
+    pool?.quote_token_address ||
+    pool?.quote_mint ||
+    pool?.quote?.mint ||
+    null;
+}
+
 function getVolatilityTimeframe(sourceTimeframe) {
   const source = String(sourceTimeframe || "").trim();
   const sourceMinutes = TIMEFRAME_MINUTES[source];
@@ -421,6 +429,17 @@ export function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
   if (pool?.pool_type && !["dlmm", "damm_v2"].includes(pool.pool_type)) return `pool_type ${pool.pool_type} is not dlmm/damm_v2`;
+
+  // ── SOL-quote gate: deploy_position only supports single-sided SOL (amount_y),
+  // so the quote token (token_y) MUST be wrapped SOL. Pools quoted in USDC/USDT/
+  // other pass every numeric gate but always fail at deploy with a simulation
+  // error ("single-sided SOL not supported for <PAIR> pool"). Reject them here
+  // before they waste a screening cycle and a failed deploy attempt.
+  const quoteMint = getPoolQuoteMint(pool);
+  const solMint = config.tokens.SOL;
+  if (quoteMint && solMint && quoteMint !== solMint) {
+    return `quote token is not SOL (${pool?.token_y?.symbol || quoteMint.slice(0, 8)}) — single-sided SOL deploy unsupported`;
+  }
 
   if (mcap == null || mcap < minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${minMcap}`;
   if (mcap > maxMcap) return `mcap ${mcap} above maxMcap ${maxMcap}`;
@@ -1314,6 +1333,22 @@ export async function getTopCandidates({ limit = 10 } = {}) {
             mint: pool.base?.mint,
             side: "entry",
           });
+          if (
+            !confirmation.confirmed &&
+            !confirmation.skipped &&
+            config.indicators.entryFallbackPreset
+          ) {
+            const fallback = await confirmIndicatorPreset({
+              mint: pool.base?.mint,
+              side: "entry",
+              preset: config.indicators.entryFallbackPreset,
+            });
+            if (fallback.confirmed) {
+              confirmation.confirmed = true;
+              confirmation.reason = `${confirmation.reason} → FALLBACK: ${fallback.reason}`;
+              confirmation.fallback = fallback.preset;
+            }
+          }
           return { pool: pool.pool, confirmation };
         } catch (error) {
           return {

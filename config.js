@@ -137,6 +137,7 @@ export const config = {
     blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    top10ExemptMints:  u.top10ExemptMints  ?? [],  // base-token mints exempt from the maxTop10Pct gate (high-conviction overrides)
     loneCandidateMinDegen: u.loneCandidateMinDegen ?? 50, // degen score that lets a SOLO candidate deploy without a narrative
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
@@ -201,6 +202,15 @@ export const config = {
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
+    // Auto-redeploy when a position goes out-of-range fast (price moved through
+    // the range edge within minutes of deploy). Opens a new position at the new
+    // active bin to chase the move; the old OOR position still closes via the
+    // normal OOR/stop-loss rules. Guards: maxPositions, wallet balance, and a
+    // per-position chase cap to avoid burning SOL in a runaway pump.
+    oorChaseEnabled:        u.oorChaseEnabled        ?? false,
+    oorChaseFastMinutes:    u.oorChaseFastMinutes    ?? 5,
+    oorChaseSlowMinutes:    u.oorChaseSlowMinutes    ?? 10,
+    maxOorChasesPerPool:    u.maxOorChasesPerPool    ?? 2,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
     repeatDeployCooldownTriggerCount: u.repeatDeployCooldownTriggerCount ?? 3,
     repeatDeployCooldownHours: u.repeatDeployCooldownHours ?? 12,
@@ -234,6 +244,15 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    // Downside range as a percentage below the active price. When the LLM
+    // doesn't pass an explicit downside_pct, deploy defaults to this. The
+    // [min, max] pair is enforced by the deploy safety check — a requested
+    // downside_pct outside this band is rejected. Wide ranges (-75%) need
+    // many bins (see maxBinsAbove ≈ 140), so every such deploy uses the
+    // multi-tx wide-range path.
+    defaultDownsidePct: u.defaultDownsidePct ?? 75,
+    minDownsidePct:     u.minDownsidePct     ?? 70,
+    maxDownsidePct:     u.maxDownsidePct     ?? 80,
   },
 
   // ─── Scheduling ─────────────────────────
@@ -383,6 +402,12 @@ export const config = {
     // NEVER gated regardless of this flag. Defaults on so the A/B test
     // (gate-on vs gate-off) is explicit via analyze-performance bucketing.
     exitGateEnabled: indicatorUserConfig.exitGateEnabled ?? true,
+
+    // ── entry fallback preset ──
+    // When the primary entryPreset rejects, try this preset as an OR.
+    // null = no fallback (hard reject on primary failure).
+    entryFallbackPreset: indicatorUserConfig.entryFallbackPreset ?? null,
+    athBreakingMaxDrawdownPct: Number(indicatorUserConfig.athBreakingMaxDrawdownPct ?? 15),
   },
 
   // ─── Markov Chain Analysis ─────────────
@@ -432,6 +457,7 @@ export function reloadScreeningThresholds() {
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
     if (fresh.minTokenFeesSol  != null) s.minTokenFeesSol  = fresh.minTokenFeesSol;
     if (fresh.maxTop10Pct      != null) s.maxTop10Pct      = fresh.maxTop10Pct;
+    if (fresh.top10ExemptMints !== undefined) s.top10ExemptMints = fresh.top10ExemptMints;
     if (fresh.useDiscordSignals !== undefined) s.useDiscordSignals = fresh.useDiscordSignals;
     if (fresh.discordSignalMode != null) s.discordSignalMode = fresh.discordSignalMode;
     if (fresh.useGmgnTrending       !== undefined) s.useGmgnTrending       = fresh.useGmgnTrending;
@@ -487,5 +513,13 @@ export function reloadScreeningThresholds() {
       config.strategy.minBinsBelow,
       Math.min(config.strategy.maxBinsBelow, Math.round(defaultBinsBelow)),
     );
+    if (fresh.defaultDownsidePct != null) config.strategy.defaultDownsidePct = Number(fresh.defaultDownsidePct);
+    if (fresh.minDownsidePct     != null) config.strategy.minDownsidePct     = Number(fresh.minDownsidePct);
+    if (fresh.maxDownsidePct     != null) config.strategy.maxDownsidePct     = Number(fresh.maxDownsidePct);
+    // OOR-chase (management) — re-applied so update_config takes effect live.
+    if (fresh.oorChaseEnabled     !== undefined) config.management.oorChaseEnabled     = fresh.oorChaseEnabled;
+    if (fresh.oorChaseFastMinutes != null) config.management.oorChaseFastMinutes     = Number(fresh.oorChaseFastMinutes);
+    if (fresh.oorChaseSlowMinutes != null) config.management.oorChaseSlowMinutes     = Number(fresh.oorChaseSlowMinutes);
+    if (fresh.maxOorChasesPerPool != null) config.management.maxOorChasesPerPool     = Number(fresh.maxOorChasesPerPool);
   } catch { /* ignore */ }
 }

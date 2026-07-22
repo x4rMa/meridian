@@ -253,6 +253,23 @@ async function validateDeployPoolThresholds(args) {
     // checks, which apply to DAMM pools too.
   }
 
+  // ── Downside-range gate (DLMM + DAMM): enforce [minDownsidePct, maxDownsidePct].
+  // The deploy path defaults downside_pct to defaultDownsidePct when null, so an
+  // explicit out-of-band value here is the operator/LLM overriding the configured
+  // -70/-80% envelope. Reject rather than silently clamp — a too-narrow range
+  // loses the "absorb the dump" intent, and a too-wide range blows out bin count.
+  if (args.downside_pct != null) {
+    const dPct = numberOrNull(args.downside_pct);
+    const minD = numberOrNull(config.strategy.minDownsidePct);
+    const maxD = numberOrNull(config.strategy.maxDownsidePct);
+    if (dPct != null && minD != null && maxD != null && minD <= maxD && (dPct < minD || dPct > maxD)) {
+      const reason = `Requested downside_pct ${dPct}% outside configured range [${minD}%, ${maxD}%]. Let the default (${config.strategy.defaultDownsidePct ?? 75}%) apply by omitting downside_pct, or set it within the band. (pool: ${args.pool_address?.slice?.(0, 8) ?? "?"})`;
+      console.error(`[SAFETY_BLOCK] deploy_position rejected: ${reason}`);
+      log("safety_block", `deploy_position rejected: ${reason}`);
+      return { pass: false, reason };
+    }
+  }
+
   const tvl = poolDetailTvl(detail);
   const tvlBounds = tvlBoundsForTier(args.tier, args.age_band);
   if (tvl == null) {
@@ -406,8 +423,9 @@ function normalizeConfigValue(key, value) {
     "markovEnabled",
     "rsiDivergenceAllowHidden",
     "exitGateEnabled",
+    "oorChaseEnabled",
   ]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals", "top10ExemptMints"]);
   const jsonObjectKeys = new Set(["tokenAgeBands"]);
   const stringKeys = new Set([
     "timeframe",
@@ -432,6 +450,7 @@ function normalizeConfigValue(key, value) {
     "gmgnSignalMode",
     "gmgnTrendingInterval",
     "gmgnTrendingOrderBy",
+    "entryFallbackPreset",
   ]);
   if (value === null) return null;
   if (jsonObjectKeys.has(key)) {
@@ -572,6 +591,7 @@ const toolMap = {
       blockPvpSymbols: ["screening", "blockPvpSymbols"],
       maxBotHoldersPct: ["screening", "maxBotHoldersPct"],
       maxTop10Pct: ["screening", "maxTop10Pct"],
+      top10ExemptMints: ["screening", "top10ExemptMints"],
       allowedLaunchpads: ["screening", "allowedLaunchpads"],
       blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
@@ -659,6 +679,14 @@ const toolMap = {
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],
+      defaultDownsidePct: ["strategy", "defaultDownsidePct"],
+      minDownsidePct: ["strategy", "minDownsidePct"],
+      maxDownsidePct: ["strategy", "maxDownsidePct"],
+      // oor-chase (management)
+      oorChaseEnabled: ["management", "oorChaseEnabled"],
+      oorChaseFastMinutes: ["management", "oorChaseFastMinutes"],
+      oorChaseSlowMinutes: ["management", "oorChaseSlowMinutes"],
+      maxOorChasesPerPool: ["management", "maxOorChasesPerPool"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
@@ -707,6 +735,8 @@ const toolMap = {
       athLookbackHours: ["indicators", "athLookbackHours", ["chartIndicators", "athLookbackHours"]],
       maxAthDrawdownPct: ["indicators", "maxAthDrawdownPct", ["chartIndicators", "maxAthDrawdownPct"]],
       minDrawdownFromAth: ["indicators", "minDrawdownFromAth", ["chartIndicators", "minDrawdownFromAth"]],
+      entryFallbackPreset: ["indicators", "entryFallbackPreset", ["chartIndicators", "entryFallbackPreset"]],
+      athBreakingMaxDrawdownPct: ["indicators", "athBreakingMaxDrawdownPct", ["chartIndicators", "athBreakingMaxDrawdownPct"]],
       // exit-side indicator gate toggle (discretionary exits only)
       exitGateEnabled: ["indicators", "exitGateEnabled", ["chartIndicators", "exitGateEnabled"]],
       // markov
@@ -845,6 +875,21 @@ const toolMap = {
           Math.round(Number(config.strategy.defaultBinsBelow ?? config.strategy.maxBinsBelow)),
         ),
       );
+    }
+
+    // Downside-range consistency: ensure minDownsidePct <= defaultDownsidePct <= maxDownsidePct.
+    if (
+      applied.minDownsidePct != null ||
+      applied.maxDownsidePct != null ||
+      applied.defaultDownsidePct != null
+    ) {
+      const lo = Number(config.strategy.minDownsidePct ?? 70);
+      const hi = Number(config.strategy.maxDownsidePct ?? 80);
+      const dft = Number(config.strategy.defaultDownsidePct ?? 75);
+      if (lo > hi) {
+        return { success: false, error: `minDownsidePct (${lo}) must be <= maxDownsidePct (${hi})`, reason };
+      }
+      config.strategy.defaultDownsidePct = Math.max(lo, Math.min(hi, dft));
     }
 
     for (const [key, val] of Object.entries(applied)) {

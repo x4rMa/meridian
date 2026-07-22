@@ -270,6 +270,8 @@ const { values: flags } = parseArgs({
     wallet:     { type: "string" },
     timeframe:  { type: "string" },
     reason:     { type: "string" },
+    tier:       { type: "string" },
+    "age-band": { type: "string" },
     "bins-below": { type: "string" },
     "bins-above": { type: "string" },
     "amount-x":   { type: "string" },
@@ -477,6 +479,8 @@ switch (subcommand) {
       single_sided_x: argv.includes("--single-sided-x"),
       bins_below: flags["bins-below"] ? parseInt(flags["bins-below"]) : undefined,
       bins_above: flags["bins-above"] ? parseInt(flags["bins-above"]) : undefined,
+      tier: flags.tier,
+      age_band: flags["age-band"],
       allow_duplicate_pool: argv.includes("--allow-duplicate-pool"),
     }));
     break;

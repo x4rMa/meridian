@@ -144,6 +144,7 @@ export function trackPosition({
   entry_volume = null,
   entry_holders = null,
   pool_type = "dlmm",
+  tier = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -167,11 +168,13 @@ export function trackPosition({
     entry_holders,
     signal_snapshot: signal_snapshot || null,
     pool_type,
+    tier,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
     last_claim_at: null,
     total_fees_claimed_usd: 0,
     rebalance_count: 0,
+    oor_chase_count: 0,
     closed: false,
     closed_at: null,
     state_status: "open",
@@ -226,6 +229,22 @@ export function markInRange(position_address) {
     save(state);
     log("state", `Position ${position_address} back in range`);
   }
+}
+
+/**
+ * Bump the OOR-chase counter on a position (how many times we've redeployed
+ * a new position to chase the price after this one went out-of-range fast).
+ * Capped at config.management.maxOorChasesPerPool by the caller; this helper
+ * just increments and returns the new count.
+ */
+export function incrementOorChase(position_address) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return 0;
+  pos.oor_chase_count = (pos.oor_chase_count ?? 0) + 1;
+  save(state);
+  log("state", `Position ${position_address} OOR chase count -> ${pos.oor_chase_count}`);
+  return pos.oor_chase_count;
 }
 
 /**

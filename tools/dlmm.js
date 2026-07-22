@@ -525,6 +525,12 @@ export async function deployPosition({
     });
   }
   const activeStrategy = strategy || config.strategy.strategy;
+  // The downside range is the primary range driver. When the caller passes an
+  // explicit bins_below, honor it (legacy path). Otherwise default downside_pct
+  // to config.strategy.defaultDownsidePct (75) so the price→bin block runs and
+  // derives the bin count from the -75% intent rather than a flat bin count.
+  const cfgDefaultDownside = Number(config.strategy.defaultDownsidePct ?? 75);
+  let effectiveDownsidePct = downside_pct != null ? Number(downside_pct) : (bins_below == null ? cfgDefaultDownside : null);
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
   const parsedVolatility = volatility == null ? null : Number(volatility);
@@ -550,8 +556,8 @@ export async function deployPosition({
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
 
-  if (downside_pct != null || upside_pct != null) {
-    const downsidePct = Math.max(0, Number(downside_pct ?? 0));
+  if (effectiveDownsidePct != null || upside_pct != null) {
+    const downsidePct = Math.max(0, Number(effectiveDownsidePct ?? 0));
     const upsidePct = Math.max(0, Number(upside_pct ?? 0));
 
     if (!Number.isFinite(downsidePct) || !Number.isFinite(upsidePct)) {
@@ -568,6 +574,24 @@ export async function deployPosition({
 
     activeBinsBelow = Math.max(0, activeBin.binId - lowerBinId);
     activeBinsAbove = Math.max(0, upperBinId - activeBin.binId);
+  }
+
+  // Clamp the bin range into the configured [minBinsBelow, maxBinsBelow] envelope.
+  // Runs after the downside_pct recompute so it covers both the default-fallback
+  // path and the percentage-derived path. minBinsBelow is a hard floor (raise tiny
+  // ranges up). maxBinsBelow is a safety ceiling — with defaultDownsidePct=75 the
+  // downside-derived bin count (~139 at bin_step 100) is meant to fit under it, so
+  // set maxBinsBelow high enough (≈140) that the ceiling doesn't narrow the -75%
+  // intent. If it does narrow, log loudly so the operator notices.
+  const cfgMinBelow = Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW);
+  const cfgMaxBelow = Number(config.strategy.maxBinsBelow ?? cfgMinBelow);
+  if (Number.isFinite(cfgMinBelow) && activeBinsBelow < cfgMinBelow) {
+    log("deploy", `bins_below ${activeBinsBelow} below minBinsBelow ${cfgMinBelow} — clamping up`);
+    activeBinsBelow = cfgMinBelow;
+  }
+  if (Number.isFinite(cfgMaxBelow) && cfgMaxBelow >= cfgMinBelow && activeBinsBelow > cfgMaxBelow) {
+    log("deploy", `bins_below ${activeBinsBelow} above maxBinsBelow ${cfgMaxBelow} — clamping down (downside range narrowed)`);
+    activeBinsBelow = cfgMaxBelow;
   }
 
   const strategyMap = {
@@ -634,7 +658,7 @@ export async function deployPosition({
         strategy: activeStrategy,
         bins_below: activeBinsBelow,
         bins_above: activeBinsAbove,
-        downside_pct: downside_pct ?? null,
+        downside_pct: effectiveDownsidePct ?? downside_pct ?? null,
         upside_pct: upside_pct ?? null,
         amount_x: finalAmountX,
         amount_y: finalAmountY,
@@ -769,6 +793,7 @@ export async function deployPosition({
           entry_tvl,
           entry_volume,
           entry_holders,
+          tier: tier ?? null,
         });
       }
 
@@ -918,6 +943,7 @@ export async function deployPosition({
       entry_tvl,
       entry_volume,
       entry_holders,
+      tier: tier ?? null,
     });
 
     appendDecision({
@@ -938,7 +964,7 @@ export async function deployPosition({
         active_bin: activeBin.binId,
         min_bin: minBinId,
         max_bin: maxBinId,
-        downside_pct: downside_pct ?? null,
+        downside_pct: effectiveDownsidePct ?? downside_pct ?? null,
         upside_pct: upside_pct ?? null,
       },
     });
@@ -1452,6 +1478,12 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,
+          // Fast-OOR-chase fields (surfaced so the management cycle can detect
+          // a position that went OOR within oorChaseFastMinutes of deploy).
+          time_to_oor_minutes: tracked?.time_to_oor_minutes ?? null,
+          oor_chase_count:    tracked?.oor_chase_count ?? 0,
+          tier:               tracked?.tier ?? null,
+          strategy:           tracked?.strategy ?? null,
         });
       }
     }

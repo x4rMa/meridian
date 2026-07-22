@@ -24,11 +24,12 @@ import {
   editMessageWithButtons,
   answerCallbackQuery,
   notifyOutOfRange,
+  notifyDeploy,
   isEnabled as telegramEnabled,
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, setPositionIndicatorExitCheck, setPositionExitReason, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, setPositionIndicatorExitCheck, setPositionExitReason, updatePnlAndCheckExits, confirmPeak, registerExitSignal, incrementOorChase } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { predictNextState, getMarkovSummary, calculateTransitionMatrix } from "./markov.js";
@@ -478,6 +479,10 @@ export async function runManagementCycle({ silent = false } = {}) {
     // ── Deterministic rule checks (no LLM) ──────────────────────────
     // action: CLOSE | CLAIM | STAY | INSTRUCTION (needs LLM)
     const actionMap = new Map();
+    // Fast-OOR chase candidates: positions that went out-of-range within
+    // oorChaseFastMinutes of deploy. Collected here, redeployed after the
+    // management actions (so closes free slots) and before the screening trigger.
+    const fastOorChaseCandidates = [];
     for (const p of positionData) {
       // Hard exit — highest priority
       if (exitMap.has(p.position)) {
@@ -501,6 +506,21 @@ export async function runManagementCycle({ silent = false } = {}) {
         continue;
       }
       actionMap.set(p.position, { action: "STAY" });
+
+      // Fast-OOR chase detection (runs on STAY positions that are OOR but
+      // haven't aged past outOfRangeWaitMinutes yet). time_to_oor_minutes is
+      // stamped once on the first OOR; if it's within oorChaseFastMinutes of
+      // deploy, this position is a chase candidate. The redeploy itself runs
+      // after executeManagementActions so freed slots are respected.
+      if (
+        config.management.oorChaseEnabled &&
+        p.in_range === false &&
+        p.time_to_oor_minutes != null &&
+        Number(p.time_to_oor_minutes) <= Number(config.management.oorChaseFastMinutes ?? 5) &&
+        Number(p.oor_chase_count ?? 0) < Number(config.management.maxOorChasesPerPool ?? 2)
+      ) {
+        fastOorChaseCandidates.push(p);
+      }
     }
 
     // ── Build JS report ──────────────────────────────────────────────
@@ -542,6 +562,78 @@ export async function runManagementCycle({ silent = false } = {}) {
     } else {
       log("cron", "Management: all positions STAY — skipping");
       await liveMessage?.note("No tool actions needed.");
+    }
+
+    // ── Fast-OOR chase redeploy ──────────────────────────────────────
+    // For each fast-OOR candidate, open a new position at the current active
+    // bin to chase the price move. The old OOR position stays open and closes
+    // via its own OOR/stop-loss rules — we don't force-close it. Guards:
+    // maxPositions, wallet balance, per-position chase cap, pool cooldown.
+    if (fastOorChaseCandidates.length > 0 && config.management.oorChaseEnabled) {
+      const preChasePositions = await getMyPositions({ force: true }).catch(() => null);
+      let chaseCount = preChasePositions?.positions?.length ?? 0;
+      const maxPositions = config.risk.maxPositions;
+      const chaseReports = [];
+      for (const p of fastOorChaseCandidates) {
+        if (chaseCount >= maxPositions) {
+          log("cron", `OOR chase skipped for ${p.pair}: at maxPositions (${chaseCount}/${maxPositions})`);
+          chaseReports.push(`• ${p.pair}: skipped (at maxPositions)`);
+          continue;
+        }
+        const bal = await getWalletBalances().catch(() => null);
+        const deployAmount = computeDeployAmount(bal?.sol ?? 0);
+        if (bal?.sol == null || bal.sol < deployAmount + (config.management.gasReserve ?? 0)) {
+          log("cron", `OOR chase skipped for ${p.pair}: insufficient SOL (${bal?.sol ?? "?"} < ${deployAmount} + gas)`);
+          chaseReports.push(`• ${p.pair}: skipped (insufficient SOL)`);
+          continue;
+        }
+        log("cron", `OOR chase: redeploying ${deployAmount} SOL on ${p.pair} (time-to-OOR ${p.time_to_oor_minutes}m, chase #${(p.oor_chase_count ?? 0) + 1})`);
+        try {
+          const result = await executeTool("deploy_position", {
+            pool_address: p.pool,
+            amount_sol: deployAmount,
+            strategy: p.strategy || config.strategy.strategy,
+            downside_pct: config.strategy.defaultDownsidePct,
+            tier: p.tier || "degen",
+          });
+          if (result?.success) {
+            incrementOorChase(p.position);
+            chaseCount += 1;
+            const newPos = result.position ?? result.position_address ?? "?";
+            chaseReports.push(`• ${p.pair}: ✅ chased → ${String(newPos).slice(0, 8)} (${deployAmount} SOL)`);
+            if (telegramEnabled()) {
+              notifyDeploy({
+                pair: p.pair,
+                amountSol: deployAmount,
+                position: newPos,
+                tx: result.tx ?? null,
+                binStep: result.bin_step ?? null,
+                baseFee: result.fee_pct ?? null,
+              }).catch(() => {});
+            }
+            appendDecision({
+              type: "deploy",
+              actor: "MANAGER",
+              pool: p.pool,
+              pool_name: p.pair,
+              summary: `Fast-OOR chase redeploy: ${deployAmount} SOL on ${p.pair} (time-to-OOR ${p.time_to_oor_minutes}m)`,
+              reason: `position went OOR within ${config.management.oorChaseFastMinutes}m of deploy — chasing price`,
+              risks: ["oor-chase"],
+              metrics: { time_to_oor_minutes: p.time_to_oor_minutes, deploy_amount_sol: deployAmount, chase_number: (p.oor_chase_count ?? 0) + 1 },
+              rejected: [],
+            });
+          } else {
+            chaseReports.push(`• ${p.pair}: ❌ chase failed (${result?.error ?? "unknown"})`);
+            log("cron_error", `OOR chase deploy failed for ${p.pair}: ${result?.error ?? "unknown"}`);
+          }
+        } catch (e) {
+          chaseReports.push(`• ${p.pair}: ❌ chase error (${e.message})`);
+          log("cron_error", `OOR chase deploy threw for ${p.pair}: ${e.message}`);
+        }
+      }
+      if (chaseReports.length > 0) {
+        mgmtReport += `\n\n🔄 OOR Chase\n${chaseReports.join("\n")}`;
+      }
     }
 
     // Trigger screening after management
@@ -691,7 +783,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
       }
       const top10Pct = ti?.audit?.top_holders_pct;
       const maxTop10Pct = config.screening.maxTop10Pct;
-      if (top10Pct != null && maxTop10Pct != null && top10Pct > maxTop10Pct) {
+      const top10Exempt = Array.isArray(config.screening.top10ExemptMints) &&
+        config.screening.top10ExemptMints.includes(pool?.base?.mint);
+      if (top10Exempt) {
+        log("screening", `Top10-holder filter: ${pool.name} exempt (mint ${pool?.base?.mint?.slice(0, 8)} in top10ExemptMints; top10 ${top10Pct}% would have failed > ${maxTop10Pct}%)`);
+      } else if (top10Pct != null && maxTop10Pct != null && top10Pct > maxTop10Pct) {
         log("screening", `Top10-holder filter: dropped ${pool.name} — top10 ${top10Pct}% > ${maxTop10Pct}%`);
         filteredOut.push({ name: pool.name, reason: `top10 concentration ${top10Pct}% > ${maxTop10Pct}%` });
         return false;
@@ -2048,11 +2144,13 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
   const botPct = Number(tokenInfo.audit?.bot_holders_pct ?? pool.gmgn_bot_degen_pct);
 
-  // Hard fundamental gates — no override.
+  // Hard fundamental gates — no override (except top10ExemptMints for top10).
   if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
     return `token fees ${globalFeesSol} SOL below minimum ${config.screening.minTokenFeesSol} SOL`;
   }
-  if (Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {
+  const top10Exempt = Array.isArray(config.screening.top10ExemptMints) &&
+    config.screening.top10ExemptMints.includes(pool?.base?.mint);
+  if (!top10Exempt && Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {
     return `top10 concentration ${top10Pct}% above maximum ${config.screening.maxTop10Pct}%`;
   }
   if (Number.isFinite(botPct) && botPct > config.screening.maxBotHoldersPct) {
