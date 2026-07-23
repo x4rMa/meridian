@@ -12,7 +12,7 @@ import {
 import { getWalletBalances, swapToken, getTokenBalance } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { setPositionInstruction, setPositionHoldUntil } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { getMarkovState } from "../markov.js";
@@ -497,6 +497,11 @@ const toolMap = {
     const ok = setPositionInstruction(position_address, instruction || null);
     if (!ok) return { error: `Position ${position_address} not found in state` };
     return { saved: true, position: position_address, instruction: instruction || null };
+  },
+  set_hold_until: ({ position_address, hours }) => {
+    const res = setPositionHoldUntil(position_address, Number(hours));
+    if (!res.saved) return { error: `Position ${position_address} not found in state` };
+    return { saved: true, position: position_address, hold_until: res.hold_until, hours: Number(hours) };
   },
   self_update: async () => {
     try {

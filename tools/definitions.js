@@ -732,6 +732,29 @@ Pass null or empty string to clear an existing instruction.`,
       }
     }
   },
+  {
+    type: "function",
+    function: {
+      name: "set_hold_until",
+      description: `Set a per-position hold window that exempts the position from the LOW_YIELD deterministic close rule until the window expires.
+Use this when the user has advance knowledge of a near-term catalyst (e.g. "this token pumps in ~3h", insider info, scheduled listing) and needs to prevent the low-yield rule from closing a thin-fee position before the surge.
+ONLY the low-yield (Rule 5) close is skipped — stop-loss, trailing take-profit, out-of-range, and take-profit still fire normally. The hold auto-expires at the given time; pass 0 or a negative number to clear an existing hold early.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position address to attach the hold to"
+          },
+          hours: {
+            type: "number",
+            description: "How many hours from now to hold until (e.g. 3 for a 3-hour hold). Pass 0 or a negative number to clear the hold.",
+          }
+        },
+        required: ["position_address", "hours"]
+      }
+    }
+  },
 
   {
     type: "function",

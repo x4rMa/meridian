@@ -1478,6 +1478,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,
+          hold_until:         tracked?.hold_until ?? null,
           // Fast-OOR-chase fields (surfaced so the management cycle can detect
           // a position that went OOR within oorChaseFastMinutes of deploy).
           time_to_oor_minutes: tracked?.time_to_oor_minutes ?? null,

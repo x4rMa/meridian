@@ -417,6 +417,7 @@ const BOT_COMMANDS = [
   { command: "close",      description: "Close one position by index" },
   { command: "closeall",   description: "Close all open positions" },
   { command: "set",        description: "Set note/instruction on position" },
+  { command: "hold",       description: "Hold position N for X hours (skip low-yield)" },
   { command: "config",     description: "Show important runtime config" },
   { command: "settings",   description: "Button menu for common config" },
   { command: "setcfg",     description: "Update persisted config key" },

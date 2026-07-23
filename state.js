@@ -312,6 +312,47 @@ export function setPositionInstruction(position_address, instruction) {
   return true;
 }
 
+/**
+ * Set a per-position hold window that exempts LOW_YIELD (and deterministic
+ * Rule 5) from closing the position until the timestamp passes. Used when an
+ * operator has advance knowledge of a near-term catalyst (e.g. "pumps in ~3h")
+ * and needs to prevent the low-yield rule from closing a thin-fee position
+ * before the surge. Stop-loss, trailing TP, OOR, and take-profit remain
+ * fully active — this exempts yield-based closes only.
+ * @param {string} position_address
+ * @param {number} hours - hold duration in hours; <= 0 clears the hold.
+ * @returns {{ saved: boolean, hold_until: string|null }}
+ */
+export function setPositionHoldUntil(position_address, hours) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return { saved: false, hold_until: null };
+  if (!Number.isFinite(hours) || hours <= 0) {
+    pos.hold_until = null;
+    save(state);
+    log("state", `Position ${position_address} hold_until cleared`);
+    return { saved: true, hold_until: null };
+  }
+  const expiry = new Date(Date.now() + hours * 3600_000);
+  pos.hold_until = expiry.toISOString();
+  save(state);
+  log("state", `Position ${position_address} hold_until set to ${pos.hold_until} (${hours}h)`);
+  return { saved: true, hold_until: pos.hold_until };
+}
+
+/**
+ * Whether a position's LOW_YIELD exemption is currently active (hold_until
+ * exists and hasn't expired). Expired holds are ignored, not mutated — the
+ * timestamp stays as an audit trail; the time comparison is what expires it.
+ * @param {object} pos - a state.json position object (must have .hold_until)
+ */
+export function isHoldUntilActive(pos) {
+  if (!pos || !pos.hold_until) return false;
+  const expiry = new Date(pos.hold_until).getTime();
+  if (!Number.isFinite(expiry)) return false;
+  return Date.now() < expiry;
+}
+
 // Stamp the exit-indicator-gate result on the position so the close path's
 // recordPerformance call can attribute the close (or veto) to the gate that
 // was consulted. Persisted because the gate runs in executeManagementActions
@@ -475,6 +516,7 @@ export function getStateSummary() {
       initial_fee_tvl_24h: p.initial_fee_tvl_24h,
       rebalance_count: p.rebalance_count,
       instruction: p.instruction || null,
+      hold_until: p.hold_until || null,
       state_status: p.state_status || "open",
     })),
     last_updated: state.lastUpdated,
@@ -595,13 +637,17 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Low yield (only after position has had time to accumulate fees) ───
+  // Skipped while a per-position hold_until exemption is active — that window
+  // is set by an operator with near-term catalyst knowledge and intentionally
+  // prevents LOW_YIELD from closing a thin-fee position before the surge.
   const { age_minutes } = positionData;
   const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
   if (
     fee_per_tvl_24h != null &&
     mgmtConfig.minFeePerTvl24h != null &&
     fee_per_tvl_24h < mgmtConfig.minFeePerTvl24h &&
-    (age_minutes == null || age_minutes >= minAgeForYieldCheck)
+    (age_minutes == null || age_minutes >= minAgeForYieldCheck) &&
+    !isHoldUntilActive(pos)
   ) {
     return {
       action: "LOW_YIELD",

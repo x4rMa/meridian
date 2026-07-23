@@ -29,7 +29,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, setPositionIndicatorExitCheck, setPositionExitReason, updatePnlAndCheckExits, confirmPeak, registerExitSignal, incrementOorChase } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, setPositionHoldUntil, isHoldUntilActive, setPositionIndicatorExitCheck, setPositionExitReason, updatePnlAndCheckExits, confirmPeak, registerExitSignal, incrementOorChase } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { predictNextState, getMarkovSummary, calculateTransitionMatrix } from "./markov.js";
@@ -535,6 +535,10 @@ export async function runManagementCycle({ silent = false } = {}) {
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD*" : act.action;
       let line = `${inRange} **${p.pair}** | ${p.age_minutes ?? "?"}m | ${val} | fee ${unclaimed} | PnL ${p.pnl_pct ?? "?"}% | y${p.fee_per_tvl_24h ?? "?"}% | ${statusLabel}`;
       if (p.instruction) line += ` | note: ${p.instruction}`;
+      if (p.hold_until && isHoldUntilActive(p)) {
+        const minsLeft = Math.max(0, Math.round((new Date(p.hold_until).getTime() - Date.now()) / 60000));
+        line += ` | HOLD ${minsLeft}m`;
+      }
       if (act.action === "CLOSE" && act.rule === "exit") line += ` | ⚡${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += ` | R${act.rule}:${act.reason}`;
       if (act.action === "CLAIM") line += ` | →claim`;
@@ -1299,7 +1303,8 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
+    (position.age_minutes ?? 0) >= 60 &&
+    !isHoldUntilActive(tracked)
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
   }
@@ -1690,6 +1695,7 @@ function formatHelpText() {
     "/close <n> — close one position by index",
     "/closeall — close all open positions",
     "/set <n> <note> — set note/instruction on position",
+    "/hold <n> <hours> — skip low-yield close for N hours (insider-hold)",
     "/config — show important runtime config",
     "/settings — button menu for common config",
     "/setcfg <key> <value> — update persisted config",
@@ -1894,6 +1900,9 @@ async function telegramHandler(msg) {
         `Value: ${config.management.solMode ? "◎" : "$"}${pos.total_value_usd ?? "?"}`,
         `Age: ${pos.age_minutes ?? "?"}m | ${pos.in_range ? "IN RANGE" : `OOR ${pos.minutes_out_of_range ?? 0}m`}`,
         pos.instruction ? `Note: ${pos.instruction}` : null,
+        (pos.hold_until && isHoldUntilActive(pos))
+          ? `Hold until: ${pos.hold_until} (${Math.max(0, Math.round((new Date(pos.hold_until).getTime() - Date.now()) / 60000))}m left, skips low-yield)`
+          : null,
       ].filter(Boolean).join("\n"));
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
@@ -1952,6 +1961,24 @@ async function telegramHandler(msg) {
       const pos = positions[idx];
       setPositionInstruction(pos.position, note);
       await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    return;
+  }
+
+  const holdMatch = text.match(/^\/hold\s+(\d+)\s+([0-9]+(?:\.[0-9]+)?)\s*$/i);
+  if (holdMatch) {
+    try {
+      const idx = parseInt(holdMatch[1]) - 1;
+      const hours = parseFloat(holdMatch[2]);
+      const { positions } = await getMyPositions({ force: true });
+      if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
+      const pos = positions[idx];
+      const res = setPositionHoldUntil(pos.position, hours);
+      if (!res.saved) { await sendMessage(`❌ Position not tracked: ${pos.position}`); return; }
+      await sendMessage(res.hold_until
+        ? `⏸️ Hold set for ${pos.pair}: low-yield close skipped until ${res.hold_until} (${hours}h). Stop-loss/trailing/OOR still active.`
+        : `✅ Hold cleared for ${pos.pair}. Low-yield close resumes.`
+      );
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
