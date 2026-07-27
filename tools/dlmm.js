@@ -38,6 +38,7 @@ import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } fro
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 import { getCpAmmPositions, deployDammPosition, closeDammPosition, claimDammFees } from "./damm.js";
+import { fetchChartIndicatorsForMint, evaluatePreset } from "./chart-indicators.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -479,6 +480,91 @@ export async function getActiveBin({ pool_address }) {
   };
 }
 
+// ─── Curve strategy gate ─────────────────────────────────────────
+// Curve (StrategyType.Curve) concentrates liquidity at the active bin — high
+// yield on single-side SOL where swaps cross the active bin, but drains fastest
+// on a dump. Gate it so curve only deploys when the token shows accumulation
+// behavior, not distribution:
+//   (a) regular bullish RSI divergence (price lower low + RSI higher low) = reversal from low = accumulation
+//   (b) drawdown inside [curveMinDrawdownPct, curveMaxDrawdownPct] (~50% from ATH) = mid-cycle, not top-of-pump or dead
+// Hidden bullish divergence is continuation, NOT reversal — explicitly rejected.
+// If indicators are disabled or the API is down, downgrade conservatively (no
+// accumulation evidence → don't concentrate). The deploy still proceeds as bid_ask.
+export async function resolveCurveGate(baseMint, activeStrategy) {
+  if (activeStrategy !== "curve") return { decision: "noop", reason: "strategy not curve" };
+  if (config.strategy.curveGateEnabled === false) return { decision: "allowed", reason: "gate disabled by config" };
+  if (!config.indicators?.enabled) {
+    return { decision: "downgraded", reason: "indicators disabled — cannot verify accumulation", fallback: "bid_ask" };
+  }
+
+  const intervals = Array.isArray(config.indicators.intervals) && config.indicators.intervals.length
+    ? config.indicators.intervals
+    : ["15_MINUTE"];
+  const minDd = Number(config.strategy.curveMinDrawdownPct ?? 30);
+  const maxDd = Number(config.strategy.curveMaxDrawdownPct ?? 70);
+
+  let divergenceConfirmed = false;
+  let divergenceKind = null;
+  let drawdownPct = null;
+  let fetchErrors = 0;
+
+  for (const interval of intervals) {
+    try {
+      const payload = await fetchChartIndicatorsForMint(baseMint, { interval });
+      // RSI divergence — entry side. regular bullish = accumulation reversal from low.
+      const div = evaluatePreset("entry", "rsi_divergence", payload, interval);
+      if (div?.confirmed && !div?.skipped) {
+        const reason = String(div.reason || "");
+        if (/regular bullish/.test(reason)) {
+          divergenceConfirmed = true;
+          divergenceKind = "regular bullish";
+        }
+      }
+      // ATH drawdown — read drawdownPct from the signal field (evaluatePreset attaches it).
+      const ath = evaluatePreset("entry", "ath_drawdown", payload, interval);
+      if (ath?.signal?.drawdownPct != null) drawdownPct = ath.signal.drawdownPct;
+    } catch (e) {
+      fetchErrors++;
+    }
+  }
+
+  if (!divergenceConfirmed) {
+    return {
+      decision: "downgraded",
+      reason: "no regular bullish RSI divergence (accumulation not confirmed)",
+      fallback: "bid_ask",
+      drawdownPct,
+      fetchErrors,
+    };
+  }
+  if (drawdownPct == null) {
+    return {
+      decision: "downgraded",
+      reason: "ATH drawdown unavailable",
+      fallback: "bid_ask",
+      divergenceKind,
+      fetchErrors,
+    };
+  }
+  if (drawdownPct < minDd || drawdownPct > maxDd) {
+    return {
+      decision: "downgraded",
+      reason: `drawdown ${drawdownPct.toFixed(1)}% outside [${minDd}%, ${maxDd}%] band (not ~50% from ATH)`,
+      fallback: "bid_ask",
+      divergenceKind,
+      drawdownPct,
+      fetchErrors,
+    };
+  }
+  return {
+    decision: "allowed",
+    reason: `regular bullish divergence + drawdown ${drawdownPct.toFixed(1)}% in band`,
+    divergenceKind,
+    drawdownPct,
+    fetchErrors,
+  };
+}
+
 // ─── Deploy Position ───────────────────────────────────────────
 export async function deployPosition({
   pool_address,
@@ -524,7 +610,7 @@ export async function deployPosition({
       entry_mcap, entry_tvl, entry_volume, entry_holders,
     });
   }
-  const activeStrategy = strategy || config.strategy.strategy;
+  let activeStrategy = strategy || config.strategy.strategy;
   // The downside range is the primary range driver. When the caller passes an
   // explicit bins_below, honor it (legacy path). Otherwise default downside_pct
   // to config.strategy.defaultDownsidePct (75) so the price→bin block runs and
@@ -552,6 +638,18 @@ export async function deployPosition({
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
   }
+
+  // Curve gate: downgrade to bid_ask if accumulation (regular bullish RSI divergence)
+  // + ~50% ATH drawdown are not both confirmed. Stashed on curveGate so the deploy
+  // result + signal_snapshot can surface the decision for analyze-performance.
+  const curveGate = await resolveCurveGate(baseMint, activeStrategy);
+  if (curveGate.decision === "downgraded") {
+    log("deploy", `curve gate: downgraded to ${curveGate.fallback} — ${curveGate.reason}`);
+    activeStrategy = curveGate.fallback;
+  } else if (curveGate.decision === "allowed") {
+    log("deploy", `curve gate: allowed — ${curveGate.reason}`);
+  }
+
   const activeBin = await pool.getActiveBin();
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
@@ -717,7 +815,7 @@ export async function deployPosition({
           idempotencyKey: `deploy:${pool_address}:${minBinId}:${maxBinId}:${finalAmountY}:${finalAmountX}`,
           poolId: pool_address,
           owner: wallet.publicKey.toString(),
-          strategy: activeStrategy === "spot" ? "Spot" : "BidAsk",
+          strategy: activeStrategy === "spot" ? "Spot" : activeStrategy === "curve" ? "Curve" : "BidAsk",
           inputSOL: finalAmountY,
           amountY: finalAmountY,
           amountX: finalAmountX,
@@ -773,6 +871,8 @@ export async function deployPosition({
           age_band: age_band ?? null,
           screening_profile: screening_profile ?? null,
           tier: tier ?? null,
+          curve_gate_decision: curveGate?.decision ?? null,
+          curve_gate_drawdown_pct: curveGate?.drawdownPct ?? null,
         };
         trackPosition({
           position: positionAddress,
@@ -842,6 +942,7 @@ export async function deployPosition({
         amount_x: finalAmountX,
         amount_y: finalAmountY,
         txs: normalizeExecutionSignatures(submit),
+        curve_gate: curveGate,
       };
     } catch (error) {
       log("deploy_error", `Relay deploy failed: ${error.message}`);
@@ -923,6 +1024,8 @@ export async function deployPosition({
       age_band: age_band ?? null,
       screening_profile: screening_profile ?? null,
       tier: tier ?? null,
+      curve_gate_decision: curveGate?.decision ?? null,
+      curve_gate_drawdown_pct: curveGate?.drawdownPct ?? null,
     };
     trackPosition({
       position: newPosition.publicKey.toString(),
@@ -989,6 +1092,7 @@ export async function deployPosition({
       amount_x: finalAmountX,
       amount_y: finalAmountY,
       txs: txHashes,
+      curve_gate: curveGate,
     };
   } catch (error) {
     log("deploy_error", error.message);
@@ -1152,6 +1256,11 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   // stamped by setPositionExitReason. Stable enum for analyze-performance bucketing
   // (vs the templated close_reason string).
   "exit_reason",
+  // Curve-gate instrumentation — stamped on signal_snapshot at deploy time by
+  // deployPosition (curveGate result). Lets analyze-performance bucket by
+  // curve_gate_decision (noop/allowed/downgraded) and curve_gate_drawdown_pct.
+  "curve_gate_decision",
+  "curve_gate_drawdown_pct",
 ];
 
 function resolvePerformanceSignalSnapshot({ poolAddress, baseMint, tracked }) {

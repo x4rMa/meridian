@@ -291,6 +291,14 @@ export const config = {
     defaultDownsidePct: u.defaultDownsidePct ?? 75,
     minDownsidePct:     u.minDownsidePct     ?? 70,
     maxDownsidePct:     u.maxDownsidePct     ?? 80,
+    // Curve gate: curve concentrates liquidity at the active bin (high yield on
+    // single-side SOL) but drains fastest on a dump. Gate it so curve only deploys
+    // when (a) regular bullish RSI divergence (accumulation reversal from low) and
+    // (b) drawdown inside [curveMinDrawdownPct, curveMaxDrawdownPct] (~50% from ATH)
+    // are both confirmed. Otherwise the deploy silently downgrades to bid_ask.
+    curveGateEnabled:     u.curveGateEnabled     !== false,
+    curveMinDrawdownPct:  u.curveMinDrawdownPct  != null ? Number(u.curveMinDrawdownPct)  : 30,
+    curveMaxDrawdownPct:  u.curveMaxDrawdownPct  != null ? Number(u.curveMaxDrawdownPct)  : 70,
   },
 
   // ─── Scheduling ─────────────────────────
@@ -580,6 +588,9 @@ export function reloadScreeningThresholds() {
     if (fresh.defaultDownsidePct != null) config.strategy.defaultDownsidePct = Number(fresh.defaultDownsidePct);
     if (fresh.minDownsidePct     != null) config.strategy.minDownsidePct     = Number(fresh.minDownsidePct);
     if (fresh.maxDownsidePct     != null) config.strategy.maxDownsidePct     = Number(fresh.maxDownsidePct);
+    if (fresh.curveGateEnabled    !== undefined) config.strategy.curveGateEnabled    = fresh.curveGateEnabled !== false;
+    if (fresh.curveMinDrawdownPct != null)      config.strategy.curveMinDrawdownPct = Number(fresh.curveMinDrawdownPct);
+    if (fresh.curveMaxDrawdownPct != null)      config.strategy.curveMaxDrawdownPct = Number(fresh.curveMaxDrawdownPct);
     // OOR-chase (management) — re-applied so update_config takes effect live.
     if (fresh.oorChaseEnabled     !== undefined) config.management.oorChaseEnabled     = fresh.oorChaseEnabled;
     if (fresh.oorChaseFastMinutes != null) config.management.oorChaseFastMinutes     = Number(fresh.oorChaseFastMinutes);

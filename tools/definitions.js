@@ -132,7 +132,7 @@ PRIORITY ORDER for strategy and bins:
 2. No user spec → use the configured strategy from config.strategy.strategy and choose bins based on volatility
 
 HARD RULES:
-- Never use 'curve'.
+- Curve is gated: the system auto-downgrades curve → bid_ask unless BOTH (a) regular bullish RSI divergence (accumulation reversal from low) and (b) ~30-70% drawdown from ATH are confirmed on the entry indicator preset. You may request curve; the gate decides. If the gate downgrades, the deploy still proceeds with bid_ask.
 - Bin Step: the allowed range depends on the candidate's tier. Degen tier pools: bin_step 80-125. Midcap tier pools: bin_step 40-150 (narrower bins are acceptable for established high-fee pools). Pass the tier field so the safety check applies the right range.
 - Volatility must be positive. If volatility is 0, null, or missing, do not deploy.
 - Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
@@ -166,8 +166,8 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           strategy: {
             type: "string",
-            enum: ["bid_ask", "spot"],
-            description: "DLMM strategy type. If user specifies, use exactly what they said. Otherwise omit — the system default from config.strategy.strategy will be used automatically."
+            enum: ["bid_ask", "spot", "curve"],
+            description: "DLMM strategy type. If user specifies, use exactly what they said. Otherwise omit — the system default from config.strategy.strategy will be used automatically. Note: 'curve' is gated behind RSI-divergence + ATH-drawdown conditions; if the gate fails the deploy silently uses bid_ask."
           },
           bins_below: {
             type: "number",

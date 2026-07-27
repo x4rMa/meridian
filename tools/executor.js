@@ -425,6 +425,7 @@ function normalizeConfigValue(key, value) {
     "exitGateEnabled",
     "oorChaseEnabled",
     "washTradingEnabled",
+    "curveGateEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals", "top10ExemptMints"]);
   const jsonObjectKeys = new Set(["tokenAgeBands"]);
@@ -688,6 +689,9 @@ const toolMap = {
       defaultDownsidePct: ["strategy", "defaultDownsidePct"],
       minDownsidePct: ["strategy", "minDownsidePct"],
       maxDownsidePct: ["strategy", "maxDownsidePct"],
+      curveGateEnabled: ["strategy", "curveGateEnabled", ["strategy", "curveGateEnabled"]],
+      curveMinDrawdownPct: ["strategy", "curveMinDrawdownPct", ["strategy", "curveMinDrawdownPct"]],
+      curveMaxDrawdownPct: ["strategy", "curveMaxDrawdownPct", ["strategy", "curveMaxDrawdownPct"]],
       // wash-trading detection (grouped under washTrading in user-config.json)
       washTradingEnabled:            ["washTrading", "enabled",            ["washTrading", "enabled"]],
       washRejectScore:               ["washTrading", "rejectScore",        ["washTrading", "rejectScore"]],

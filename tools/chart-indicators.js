@@ -641,7 +641,7 @@ function evaluateAthDrawdown(side, payload, interval, opts) {
   return { confirmed, reason, ath: highestHigh, drawdownPct, effectiveLookbackHours: effectiveHours };
 }
 
-async function fetchChartIndicatorsForMint(
+export async function fetchChartIndicatorsForMint(
   mint,
   {
     interval,
