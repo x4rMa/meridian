@@ -937,6 +937,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
           price_change_1h: ti?.stats_1h?.price_change != null ? Number(ti.stats_1h.price_change) : null,
           price_change_6h: ti?.stats_6h_price_change ?? null,
           net_buyers_1h:   ti?.stats_1h?.net_buyers != null ? Number(ti.stats_1h.net_buyers) : null,
+          // Wash-risk instrumentation — measured, so analyze-performance can
+          // validate thresholds / per-component hit-rates BEFORE any ranking
+          // penalty (penaltyScore) is enabled. Buckets: wash_risk_score,
+          // wash_component_turnover, wash_component_trader, wash_component_gmgn,
+          // wash_sub_volume_tvl, wash_sub_fee_capture, wash_sub_low_visitors.
+          wash_risk_score:           pool.wash_risk?.score          ?? null,
+          wash_risk_reject:          pool.wash_risk?.reject         ?? false,
+          wash_component_turnover:   pool.wash_risk?.components?.some((c) => c.signal === "turnover_quality") ?? false,
+          wash_component_trader:     pool.wash_risk?.components?.some((c) => c.signal === "volume_per_trader") ?? false,
+          wash_component_gmgn:       pool.wash_risk?.components?.some((c) => c.signal === "gmgn") ?? false,
+          wash_component_visitor:    pool.wash_risk?.components?.some((c) => c.signal === "visitor_density") ?? false,
+          wash_sub_volume_tvl:       pool.wash_risk?.components?.some((c) => c.sub_signals?.some((s) => s.sub === "volume_tvl_ratio")) ?? false,
+          wash_sub_fee_capture:      pool.wash_risk?.components?.some((c) => c.sub_signals?.some((s) => s.sub === "fee_capture")) ?? false,
+          wash_sub_low_visitors:     pool.wash_risk?.components?.some((c) => c.signal === "visitor_density" && c.points > 0) ?? false,
         });
       }
 

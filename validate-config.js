@@ -46,7 +46,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
   "degenTargetVolRatio", "degenTargetLpCount", "degenTargetFeeRatio",
   "degenTargetLiquidity", "gmgnApiKey", "gmgnBaseUrl", "gmgnRequestDelayMs",
   "gmgnMaxRetries", "gmgnFeeSource", "markovEnabled", "markovWindowMinutes",
-  "markovThresholdPct", "chartIndicators",
+  "markovThresholdPct", "chartIndicators", "washTrading",
   "rpcUrl", "walletKey", "llmModel", "llmBaseUrl", "llmApiKey", "dryRun",
   "telegramChatId",
 ]);

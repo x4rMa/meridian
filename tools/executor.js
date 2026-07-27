@@ -424,6 +424,7 @@ function normalizeConfigValue(key, value) {
     "rsiDivergenceAllowHidden",
     "exitGateEnabled",
     "oorChaseEnabled",
+    "washTradingEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "indicatorIntervals", "top10ExemptMints"]);
   const jsonObjectKeys = new Set(["tokenAgeBands"]);
@@ -687,6 +688,29 @@ const toolMap = {
       defaultDownsidePct: ["strategy", "defaultDownsidePct"],
       minDownsidePct: ["strategy", "minDownsidePct"],
       maxDownsidePct: ["strategy", "maxDownsidePct"],
+      // wash-trading detection (grouped under washTrading in user-config.json)
+      washTradingEnabled:            ["washTrading", "enabled",            ["washTrading", "enabled"]],
+      washRejectScore:               ["washTrading", "rejectScore",        ["washTrading", "rejectScore"]],
+      washPenaltyScore:              ["washTrading", "penaltyScore",       ["washTrading", "penaltyScore"]],
+      washScaleSpan:                 ["washTrading", "scaleSpan",          ["washTrading", "scaleSpan"]],
+      washMaxVolumeTvlRatio:         ["washTrading", "maxVolumeTvlRatio",  ["washTrading", "maxVolumeTvlRatio"]],
+      washMinActiveTvlFloor:         ["washTrading", "minActiveTvlFloor",  ["washTrading", "minActiveTvlFloor"]],
+      washMinFeeCapture:             ["washTrading", "minFeeCapture",      ["washTrading", "minFeeCapture"]],
+      washMaxVolumePerTrader:        ["washTrading", "maxVolumePerTrader", ["washTrading", "maxVolumePerTrader"]],
+      washMinUniqueTraders:          ["washTrading", "minUniqueTraders",   ["washTrading", "minUniqueTraders"]],
+      washMaxBundlerRate:            ["washTrading", "maxBundlerRate",     ["washTrading", "maxBundlerRate"]],
+      washMaxRugRatio:               ["washTrading", "maxRugRatio",        ["washTrading", "maxRugRatio"]],
+      // wash component weights & combination knobs (tunable, no hidden constants)
+      washTurnoverMaxPoints:         ["washTrading", "turnoverMaxPoints",   ["washTrading", "turnoverMaxPoints"]],
+      washTraderMaxPoints:           ["washTrading", "traderMaxPoints",     ["washTrading", "traderMaxPoints"]],
+      washSingleSignalDampen:        ["washTrading", "singleSignalDampen",  ["washTrading", "singleSignalDampen"]],
+      washTraderLowCountFloor:       ["washTrading", "traderLowCountFloor", ["washTrading", "traderLowCountFloor"]],
+      washTraderHighVolMult:         ["washTrading", "traderHighVolMult",   ["washTrading", "traderHighVolMult"]],
+      washGmgnWashPoints:            ["washTrading", "gmgnWashPoints",      ["washTrading", "gmgnWashPoints"]],
+      washGmgnBundlerPoints:         ["washTrading", "gmgnBundlerPoints",   ["washTrading", "gmgnBundlerPoints"]],
+      washGmgnRugPoints:             ["washTrading", "gmgnRugPoints",        ["washTrading", "gmgnRugPoints"]],
+      washMinOrganicVisitors:        ["washTrading", "minOrganicVisitors",  ["washTrading", "minOrganicVisitors"]],
+      washVisitorMaxPoints:          ["washTrading", "visitorMaxPoints",    ["washTrading", "visitorMaxPoints"]],
       // oor-chase (management)
       oorChaseEnabled: ["management", "oorChaseEnabled"],
       oorChaseFastMinutes: ["management", "oorChaseFastMinutes"],

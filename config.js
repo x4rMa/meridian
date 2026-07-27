@@ -192,6 +192,44 @@ export const config = {
     dammMinUpsidePct:   u.dammMinUpsidePct   ?? 15, // min (max-current)/current coverage
   },
 
+  // ─── Wash-Trading Detection ─────────────────────────────────────
+  // Composite WashRiskScore — the sole wash-rejection mechanism. Multiple weak
+  // signals combine into one tunable score (fraud-detection pattern) instead of
+  // brittle one-off gates. v1 = reject-only (penaltyScore=null); enable the
+  // ranking penalty only after analyze-performance validates thresholds.
+  // Correlated turnover signals (volume/TVL + fee_capture) are merged into one
+  // "turnover quality" composite (max +4) to avoid double-counting (gamma 0.29
+  // measured on 408-position history). Log ramp compresses the efficient extreme
+  // tail. Thresholds grounded in historical PnL distribution, not intuition.
+  washTrading: {
+    enabled:            u.washTrading?.enabled            ?? true,
+    rejectScore:        u.washTrading?.rejectScore        ?? 5,    // merged turnover caps +4, GMGN +4 → max 8
+    penaltyScore:       u.washTrading?.penaltyScore       ?? null, // null = disabled (v1)
+    scaleSpan:          u.washTrading?.scaleSpan          ?? 3,    // ramp: fullPoints at threshold×scaleSpan; 1 = binary
+    maxVolumeTvlRatio:  u.washTrading?.maxVolumeTvlRatio  ?? 17,   // volume_24h / effective_active_tvl penalty start (≈p90)
+    minActiveTvlFloor:  u.washTrading?.minActiveTvlFloor  ?? 5000, // denominator numerical stabilizer
+    minFeeCapture:      u.washTrading?.minFeeCapture      ?? 0.002,// fee_24h/(volume×fee_pct/100); <0.2% = wash
+    maxVolumePerTrader: u.washTrading?.maxVolumePerTrader ?? 50000,// 24h vol / 24h-equiv unique_traders
+    minUniqueTraders:   u.washTrading?.minUniqueTraders   ?? 10,   // stability floor for per-trader math
+    maxBundlerRate:     u.washTrading?.maxBundlerRate     ?? 30,   // GMGN bundler_rate (%) ceiling
+    maxRugRatio:        u.washTrading?.maxRugRatio        ?? 0.3,  // GMGN rug_ratio ceiling
+    // ── Component weights & combination knobs (tunable, no hidden constants) ──
+    turnoverMaxPoints:    u.washTrading?.turnoverMaxPoints    ?? 4,    // turnover composite ceiling (vol_tvl + fee_capture)
+    traderMaxPoints:      u.washTrading?.traderMaxPoints      ?? 2,    // trader-density component ceiling
+    singleSignalDampen:   u.washTrading?.singleSignalDampen   ?? 0.75, // only-one-of (vol_tvl|fee_capture) fired → ×this
+    traderLowCountFloor:  u.washTrading?.traderLowCountFloor  ?? 1,    // min points when trader count is below stability floor + high vol
+    traderHighVolMult:    u.washTrading?.traderHighVolMult    ?? 10,   // vol24 > minActiveTvlFloor × this → "high volume" for the low-trader branch
+    gmgnWashPoints:       u.washTrading?.gmgnWashPoints       ?? 2,    // points for gmgn_signals.is_wash_trading === true
+    gmgnBundlerPoints:    u.washTrading?.gmgnBundlerPoints    ?? 1,    // points for bundler_rate breach
+    gmgnRugPoints:        u.washTrading?.gmgnRugPoints        ?? 1,    // points for rug_ratio breach
+    // ── Live-visitor organic-confirmation component ──
+    // GMGN visiting_count = humans currently viewing the token page. High → organic
+    // confirmed (0 pts). Low → weak wash evidence (capped +visitorMaxPoints). Missing
+    // on non-GMGN pools → null/unknown. Cannot reject alone (max +2 < rejectScore 5).
+    minOrganicVisitors:   u.washTrading?.minOrganicVisitors   ?? 100,  // >= this = organic confirmed
+    visitorMaxPoints:     u.washTrading?.visitorMaxPoints     ?? 2,    // component ceiling (weak secondary)
+  },
+
   // ─── Position Management ────────────────
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
@@ -504,6 +542,32 @@ export function reloadScreeningThresholds() {
     if (fresh.midcapMinTvl               != null) s.midcapMinTvl               = fresh.midcapMinTvl;
   if (fresh.midcapBypassIndicators     !== undefined) s.midcapBypassIndicators = fresh.midcapBypassIndicators;
   if (fresh.midcapBypassTimingFilters  !== undefined) s.midcapBypassTimingFilters = fresh.midcapBypassTimingFilters;
+    // Wash-trading detection (grouped object under washTrading)
+    if (fresh.washTrading !== undefined && typeof fresh.washTrading === "object") {
+      const w = fresh.washTrading;
+      const wt = config.washTrading;
+      if (w.enabled            !== undefined) wt.enabled            = w.enabled;
+      if (w.rejectScore        != null)       wt.rejectScore        = Number(w.rejectScore);
+      if (w.penaltyScore       !== undefined) wt.penaltyScore       = w.penaltyScore == null ? null : Number(w.penaltyScore);
+      if (w.scaleSpan          != null)       wt.scaleSpan          = Number(w.scaleSpan);
+      if (w.maxVolumeTvlRatio  != null)       wt.maxVolumeTvlRatio  = Number(w.maxVolumeTvlRatio);
+      if (w.minActiveTvlFloor  != null)       wt.minActiveTvlFloor  = Number(w.minActiveTvlFloor);
+      if (w.minFeeCapture      != null)       wt.minFeeCapture      = Number(w.minFeeCapture);
+      if (w.maxVolumePerTrader != null)       wt.maxVolumePerTrader = Number(w.maxVolumePerTrader);
+      if (w.minUniqueTraders   != null)       wt.minUniqueTraders   = Number(w.minUniqueTraders);
+      if (w.maxBundlerRate     != null)       wt.maxBundlerRate     = Number(w.maxBundlerRate);
+      if (w.maxRugRatio        != null)       wt.maxRugRatio        = Number(w.maxRugRatio);
+      if (w.turnoverMaxPoints   != null)      wt.turnoverMaxPoints   = Number(w.turnoverMaxPoints);
+      if (w.traderMaxPoints     != null)      wt.traderMaxPoints     = Number(w.traderMaxPoints);
+      if (w.singleSignalDampen  != null)      wt.singleSignalDampen  = Number(w.singleSignalDampen);
+      if (w.traderLowCountFloor != null)      wt.traderLowCountFloor = Number(w.traderLowCountFloor);
+      if (w.traderHighVolMult   != null)       wt.traderHighVolMult   = Number(w.traderHighVolMult);
+      if (w.gmgnWashPoints      != null)       wt.gmgnWashPoints      = Number(w.gmgnWashPoints);
+      if (w.gmgnBundlerPoints   != null)       wt.gmgnBundlerPoints   = Number(w.gmgnBundlerPoints);
+      if (w.gmgnRugPoints       != null)       wt.gmgnRugPoints       = Number(w.gmgnRugPoints);
+      if (w.minOrganicVisitors  != null)       wt.minOrganicVisitors  = Number(w.minOrganicVisitors);
+      if (w.visitorMaxPoints    != null)       wt.visitorMaxPoints    = Number(w.visitorMaxPoints);
+    }
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

@@ -177,6 +177,7 @@ export async function getGmgnTrending({
       price: num(item.price),
       price_change_percent_1h: num(item.price_change_percent1h),
       rank: num(item.rank),
+      visiting_count: num(item.visiting_count),
     }));
   } catch (error) {
     log("gmgn", `trending fetch failed: ${error.message}`);

@@ -242,6 +242,167 @@ export function passesFeeGate(pool, { minFeeActiveTvlRatio, minFee24hUsd = null 
   return false;
 }
 
+// ── Wash-Trading Detection (composite WashRiskScore) ────────────────────────
+// The sole wash-rejection mechanism. Multiple weak signals combine into one
+// tunable score (fraud-detection pattern). v1 = reject-only at rejectScore.
+// Correlated turnover signals (volume/TVL + fee_capture, gamma 0.29) are merged
+// into one "turnover quality" composite (max +4) to avoid double-counting.
+// GMGN off-chain signals are corroborating evidence only (+2/+1/+1).
+// Missing data → null → excluded from the sum (unknown, not safe, not risky).
+// Log ramp compresses the efficient extreme tail (empirically +0.468 PnL at >p99).
+
+/**
+ * Per-DEX resolver for the expected LP fee rate (percent) used in fee_capture.
+ * DLMM/DAMM-v2: base_fee_pct / base_fee_percentage, the LP fee in percent
+ * (e.g. 0.25 = 25bps). Returns null for unknown pool types → fee_capture no-ops.
+ */
+function getExpectedFeeRatePct(pool) {
+  const p = Number(pool?.fee_pct ?? pool?.base_fee_percentage ?? pool?.pool_config?.base_fee_pct ?? 0);
+  return Number.isFinite(p) && p > 0 ? p : null;
+}
+
+/**
+ * Logarithmic ramp: 0 at threshold (breach=1), fullPoints at threshold×scaleSpan,
+ * compressed beyond so the empirically-confirmed efficient extreme tail (>p99)
+ * does not receive full penalty. ramp = log(1+breach)/log(1+scaleSpan).
+ * scaleSpan=1 recovers binary (any breach → full).
+ */
+function washRamp(breach, scaleSpan) {
+  if (breach <= 1) return 0;
+  const span = Math.max(1, scaleSpan);
+  const r = Math.log(1 + breach) / Math.log(1 + span);
+  return Math.min(1, Math.max(0, r));
+}
+
+/**
+ * Turnover quality composite — MERGED volume_tvl_ratio + fee_capture.
+ * These are correlated (gamma 0.29, both facets of high turnover) so merging
+ * avoids triple-counting. Sub-scores each ramp 0→4; combined by max, then
+ * dampened ×0.75 if only ONE fired (corroborated evidence is stronger than
+ * single-signal). Composite caps at +4.
+ */
+async function turnoverQualityComponent(pool, w) {
+  const activeTvl = Number(pool?.active_tvl ?? pool?.tvl ?? 0);
+  const vol24 = Number(pool?.volume_24h ?? 0);
+  const fee24 = Number(pool?.fee_24h ?? estimateFee24hUsd(pool));
+  const feePct = getExpectedFeeRatePct(pool);
+  if (!(activeTvl > 0) || !(vol24 > 0)) return null; // unknown
+
+  const effActiveTvl = Math.max(activeTvl, w.minActiveTvlFloor);
+  const volRatio = vol24 / effActiveTvl;
+  const volBreach = volRatio / w.maxVolumeTvlRatio;
+  const volPoints = washRamp(volBreach, w.scaleSpan) * w.turnoverMaxPoints;
+
+  let feePoints = 0;
+  let capture = null;
+  if (feePct != null && fee24 >= 0) {
+    const expected = vol24 * (feePct / 100);
+    capture = expected > 0 ? fee24 / expected : 0;
+    if (capture < w.minFeeCapture) {
+      const feeBreach = Math.min(w.minFeeCapture / (capture > 0 ? capture : 1e-9), w.scaleSpan);
+      feePoints = washRamp(feeBreach, w.scaleSpan) * w.turnoverMaxPoints;
+    }
+  }
+
+  const bothFired = volPoints > 0 && feePoints > 0;
+  const combined = bothFired
+    ? Math.max(volPoints, feePoints)                       // corroborated → full
+    : Math.max(volPoints, feePoints) * w.singleSignalDampen; // single → dampened
+  const points = Math.min(w.turnoverMaxPoints, combined);
+
+  if (points <= 0) {
+    return { signal: "turnover_quality", value: +volRatio.toFixed(2), threshold: w.maxVolumeTvlRatio, points: 0, capture };
+  }
+  const subs = [];
+  if (volPoints > 0) subs.push({ sub: "volume_tvl_ratio", value: +volRatio.toFixed(2), points: +volPoints.toFixed(2) });
+  if (feePoints > 0) subs.push({ sub: "fee_capture", value: +capture.toFixed(4), points: +feePoints.toFixed(2) });
+  return { signal: "turnover_quality", value: +volRatio.toFixed(2), threshold: w.maxVolumeTvlRatio, points: +points.toFixed(2), sub_signals: subs };
+}
+
+/**
+ * Trader-density component (weak secondary). unit-fixed: unique_traders is a
+ * timeframe-window count, so normalize to 24h-equivalent (×1440/tf_minutes)
+ * before dividing 24h volume by it — else the threshold inflates ~288× on 5m.
+ * Near-useless vs a determined adversary who splits wallets; kept for the
+ * common low-effort wash case where trader count is genuinely tiny.
+ */
+async function traderDensityComponent(pool, w) {
+  const tfMin = TIMEFRAME_MINUTES[config.screening.timeframe] || 30;
+  const traderScale = 1440 / tfMin;
+  const tradersRaw = Number(pool?.unique_traders ?? 0);
+  const vol24 = Number(pool?.volume_24h ?? 0);
+  if (!(tradersRaw > 0) || !(vol24 > 0)) return null; // unknown
+  const traders24h = tradersRaw * traderScale;
+  const perTrader = vol24 / traders24h;
+  if (tradersRaw < w.minUniqueTraders && vol24 > w.minActiveTvlFloor * w.traderHighVolMult) {
+    const breach = Math.min(perTrader / w.maxVolumePerTrader, w.scaleSpan);
+    return { signal: "volume_per_trader", value: +perTrader.toFixed(0), threshold: w.maxVolumePerTrader, points: +Math.max(w.traderLowCountFloor, washRamp(breach, w.scaleSpan) * w.traderMaxPoints).toFixed(2), note: `low traders (${tradersRaw})` };
+  }
+  if (perTrader <= w.maxVolumePerTrader) {
+    return { signal: "volume_per_trader", value: +perTrader.toFixed(0), threshold: w.maxVolumePerTrader, points: 0 };
+  }
+  const breach = perTrader / w.maxVolumePerTrader;
+  return { signal: "volume_per_trader", value: +perTrader.toFixed(0), threshold: w.maxVolumePerTrader, points: +(washRamp(breach, w.scaleSpan) * w.traderMaxPoints).toFixed(2) };
+}
+
+/**
+ * GMGN corroborating evidence (off-chain, opaque model). Never the sole reject
+ * trigger — only adds points. is_wash_trading +gmgnWashPoints, bundler_rate
+ * +gmgnBundlerPoints, rug_ratio +gmgnRugPoints.
+ */
+async function gmgnComponent(pool, w) {
+  const g = pool?.gmgn_signals;
+  if (!g) return null; // unknown — GMGN signals absent (non-GMGN pools)
+  const subs = [];
+  if (g.is_wash_trading === true) subs.push({ sub: "gmgn_wash_flag", points: w.gmgnWashPoints });
+  if (Number(g.bundler_rate) > w.maxBundlerRate) subs.push({ sub: "bundler_rate", value: Number(g.bundler_rate), points: w.gmgnBundlerPoints });
+  if (Number(g.rug_ratio) > w.maxRugRatio) subs.push({ sub: "rug_ratio", value: +Number(g.rug_ratio).toFixed(3), points: w.gmgnRugPoints });
+  if (subs.length === 0) return null;
+  const points = subs.reduce((s, x) => s + x.points, 0);
+  return { signal: "gmgn", value: subs.map((s) => s.sub).join("+"), points: +points.toFixed(2), sub_signals: subs };
+}
+
+/**
+ * Live-visitor organic-confirmation component. GMGN's visiting_count = humans
+ * currently viewing the token page on gmgn.ai. High viewers → organic confirmed
+ * (0 points). Low viewers → weak wash evidence (capped +visitorMaxPoints). Missing
+ * (non-GMGN pools) → null/unknown. Cannot reject alone (max +2 < rejectScore 5).
+ */
+async function visitorDensityComponent(pool, w) {
+  const visitors = Number(pool?.gmgn_signals?.visiting_count);
+  if (!Number.isFinite(visitors)) return null; // unknown — non-GMGN pool or field absent
+  if (visitors >= w.minOrganicVisitors) {
+    return { signal: "visitor_density", value: visitors, threshold: w.minOrganicVisitors, points: 0, note: "organic confirmed" };
+  }
+  const breach = (w.minOrganicVisitors - visitors) / w.minOrganicVisitors;
+  const points = Math.min(w.visitorMaxPoints, breach * w.visitorMaxPoints);
+  return { signal: "visitor_density", value: visitors, threshold: w.minOrganicVisitors, points: +points.toFixed(2), note: `low visitors (${visitors})` };
+}
+
+// Async component registry. Adding a component = one function + one entry.
+// Future modules (LP concentration, wallet graphs, temporal bursts) fit the
+// (pool, w) => Promise<result|null> contract without touching existing scoring.
+const WASH_COMPONENTS = [turnoverQualityComponent, traderDensityComponent, gmgnComponent, visitorDensityComponent];
+
+export async function computeWashRiskScore(pool, w = config.washTrading) {
+  if (!w?.enabled) return { score: 0, components: [], unknown: [], reject: false };
+  const results = await Promise.all(WASH_COMPONENTS.map((fn) => fn(pool, w).catch(() => null)));
+  const components = [];
+  const unknown = [];
+  results.forEach((r, i) => {
+    if (r === null) { unknown.push(WASH_COMPONENTS[i].name.replace("Component", "")); return; }
+    if (r.points > 0) components.push(r);
+  });
+  const score = +components.reduce((s, c) => s + c.points, 0).toFixed(2);
+  return { score, components, unknown, reject: score >= w.rejectScore };
+}
+
+export async function passesWashGate(pool, w = config.washTrading) {
+  if (!w?.enabled) return { pass: true, score: 0, components: [], unknown: [] };
+  const r = await computeWashRiskScore(pool, w);
+  return { pass: !r.reject, ...r };
+}
+
 /**
  * Degen Score — a pool's efficiency relative to its liquidity, on a 0..100 scale.
  * Geometric mean of four liquidity-relative sub-scores so a HIGH score requires balance
@@ -345,7 +506,7 @@ export function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};
   const binStep = numeric(pool?.dlmm_params?.bin_step);
-  const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
+  const tvl = numeric(pool?.active_tvl ?? pool?.tvl);
   const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
   const volatility = numeric(pool?.volatility);
   const volume = numeric(pool?.volume);
@@ -495,6 +656,14 @@ export function getRawPoolScreeningRejectReason(pool, s, tier = "degen") {
     const shownRatio = (Number.isFinite(ratio24h) && ratio24h > 0) ? ratio24h : feeActiveTvlRatio;
     const floorStr = feeGateOpts.minFee24hUsd != null ? ` OR fee_24h $${fee24h.toFixed(0)} < $${feeGateOpts.minFee24hUsd}` : "";
     return `fee/active-TVL ${shownRatio ?? "unknown"} below ${feeGateOpts.minFeeActiveTvlRatio}${floorStr}`;
+  }
+  // Wash-trading composite gate — sole wash-rejection mechanism. _wash is
+  // pre-computed in fetchTierPools (after enrichFee24hForPools) so this stays
+  // sync. Missing data is excluded, not counted as safe.
+  const wash = pool?._wash;
+  if (wash && wash.reject) {
+    const sigs = wash.components.map((c) => `${c.signal}:${c.value}(+${c.points})`).join(", ");
+    return `wash-risk score ${wash.score} ≥ ${config.washTrading.rejectScore} [${sigs}]`;
   }
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
@@ -915,6 +1084,7 @@ async function fetchGmgnTrendingPools(timeframe) {
       creator: token.creator,
       price_change_percent_1h: token.price_change_percent_1h,
       trending_rank: token.rank,
+      visiting_count: token.visiting_count,
     };
     resolved.push(detail);
   }
@@ -1084,6 +1254,11 @@ async function fetchTierPools(s, tier, page_size, { timeframe, category } = {}) 
   if (tier === "degen") await enrichDiscordSignalLaunchpads(rawPools);
   await enrichFee24hForPools(rawPools, s, tier);
 
+  // Pre-compute WashRiskScore per pool so the sync getRawPoolScreeningRejectReason
+  // can read pool._wash without an await. Runs after enrichFee24hForPools since
+  // the score needs volume_24h / fee_24h / fee_active_tvl_ratio_24h.
+  await Promise.all(rawPools.map((p) => computeWashRiskScore(p).then((r) => { p._wash = r; })));
+
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
     const reason = getRawPoolScreeningRejectReason(pool, s, tier);
@@ -1222,6 +1397,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
   const s = config.screening;
 
+  // Pre-compute WashRiskScore on condensed pools so the sync filter can re-check
+  // the wash gate (defense-in-depth — condensed pool carries all score inputs).
+  await Promise.all(pools.map((p) => computeWashRiskScore(p).then((r) => { p._wash = r; })));
+
   const eligible = pools
     .filter((p) => {
       const tier = p.tier || "degen";
@@ -1238,7 +1417,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       const tierFeeGateOpts = isMidcap
         ? { minFeeActiveTvlRatio: s.midcapMinFeeActiveTvlRatio ?? bandThresh.minFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, minFee24hUsd: s.midcapMinFee24hUsd ?? bandThresh.minFee24hUsd }
         : { minFeeActiveTvlRatio: bandThresh.minFeeActiveTvlRatio ?? s.minFeeActiveTvlRatio, minFee24hUsd: bandThresh.minFee24hUsd };
-      const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
+      const tvl = Number(p.active_tvl ?? p.tvl ?? 0);
       if (Number.isFinite(tierMinTvl) && tierMinTvl > 0 && tvl < tierMinTvl) {
         pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${tierMinTvl} (${tier})`);
         return false;
@@ -1253,6 +1432,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         const fee24h = estimateFee24hUsd(p);
         const floorStr = tierFeeGateOpts.minFee24hUsd != null ? ` OR fee_24h $${fee24h.toFixed(0)} < $${tierFeeGateOpts.minFee24hUsd}` : "";
         pushFilteredReason(filteredOut, p, `fee/active-TVL ${ratio} below ${tierFeeGateOpts.minFeeActiveTvlRatio}${floorStr} (${tier})`);
+        return false;
+      }
+      // Wash-trading composite re-check. _wash pre-computed above. Missing data
+      // excluded, not counted as safe.
+      if (p._wash && p._wash.reject) {
+        const sigs = p._wash.components.map((c) => `${c.signal}(+${c.points})`).join(", ");
+        pushFilteredReason(filteredOut, p, `wash-risk ${p._wash.score} ≥ ${config.washTrading.rejectScore} [${sigs}]`);
+        log("wash", `rejected ${p.name}: score ${p._wash.score} [${p._wash.components.map((c) => c.signal).join(",")}]`);
         return false;
       }
       if (!isUsableVolatility(p.volatility)) {
@@ -1479,6 +1666,20 @@ function condensePool(p) {
     // Meridian's on-chain gates for LLM visibility — do NOT bypass them).
     gmgn_trending: Boolean(p.gmgn_trending),
     gmgn_signals: p.gmgn_signals || null,
+
+    // Wash-trading composite score (pre-computed in fetchTierPools / getTopCandidates).
+    // null when clean AND fully-evidenced (no unknowns) to keep the block tight.
+    wash_risk: (() => {
+      const r = p._wash;
+      if (!r) return null;
+      if (r.score === 0 && (!r.unknown || r.unknown.length === 0)) return null;
+      return {
+        score: r.score,
+        reject: r.reject,
+        components: r.components,
+        unknown: r.unknown?.length ? r.unknown : null,
+      };
+    })(),
 
     // Price action
     price: p.pool_price,
